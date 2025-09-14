@@ -41,6 +41,9 @@ class HtmlScraper(BaseScraper):
             # Extract description
             description = self._extract_description(soup)
             
+            # Extract handle (fallback method)
+            handle = self._extract_handle(soup)
+            
             # Extract images
             image_urls = self._extract_images(soup)
             
@@ -50,6 +53,7 @@ class HtmlScraper(BaseScraper):
                 name=name,
                 description=self.clean_description(description),
                 image_urls=image_urls,
+                handle=handle,
                 source='html_fallback'
             )
             
@@ -119,6 +123,35 @@ class HtmlScraper(BaseScraper):
             return meta_desc['content']
         
         return ""
+    
+    def _extract_handle(self, soup: BeautifulSoup) -> Optional[str]:
+        """Extract Shopify handle from HTML as fallback"""
+        import re
+        from urllib.parse import urlparse
+        
+        # Try to get canonical URL first
+        canonical = soup.find('link', rel='canonical')
+        if canonical and canonical.get('href'):
+            url = canonical['href']
+        else:
+            url = self.url
+        
+        # Extract handle from URL
+        try:
+            parsed = urlparse(url)
+            path = parsed.path.strip('/')
+            
+            # Match /products/handle pattern
+            match = re.search(r'/products/([^/?]+)', path)
+            if match:
+                handle = match.group(1)
+                # Clean the handle
+                handle = re.sub(r'[^a-zA-Z0-9\-_]', '', handle)
+                return handle.lower()
+        except Exception as e:
+            self.logger.warning(f"Failed to extract handle from URL {url}: {e}")
+        
+        return None
     
     def _extract_images(self, soup: BeautifulSoup) -> List[str]:
         """Extract product images from HTML"""

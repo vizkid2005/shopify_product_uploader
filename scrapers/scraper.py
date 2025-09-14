@@ -1,5 +1,6 @@
 from typing import Optional, List
 from scrapers.base import ProductData
+from scrapers.naseem import NaseemScraper
 from scrapers.shopify_json import ShopifyJsonScraper
 from scrapers.html_parser import HtmlScraper
 from utils.logger import get_logger
@@ -11,6 +12,7 @@ class ProductScraper:
     
     def __init__(self):
         self.scrapers = [
+            NaseemScraper,       # Specialized scraper for Naseem domains
             ShopifyJsonScraper,  # Try JSON first (most reliable)
             HtmlScraper          # Fallback to HTML parsing
         ]

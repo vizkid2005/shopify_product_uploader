@@ -11,6 +11,7 @@ class ProductData:
     name: str
     description: str
     image_urls: List[str]
+    handle: Optional[str] = None  # Shopify handle extracted from competitor site
     raw_data: Optional[Dict[str, Any]] = None
     source: Optional[str] = None
 

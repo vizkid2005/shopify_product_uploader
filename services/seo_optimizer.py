@@ -1,8 +1,9 @@
-from typing import Optional
+from typing import Optional, Dict, Any, List
 from openai import OpenAI
 from config.settings import settings
 from utils.logger import get_logger
 from tenacity import retry, stop_after_attempt, wait_exponential
+import json
 
 logger = get_logger(__name__)
 
@@ -19,73 +20,132 @@ class SEOOptimizer:
         self.client = OpenAI(api_key=self.api_key)
         logger.info(f"Initialized ChatGPT SEO optimizer with model: {self.model}")
     
+    def create_seo_title(self, title_parts: List[str], max_length: int = 60) -> str:
+        """Create SEO title from parts using | separator, respecting length limit"""
+        if not title_parts:
+            return "Premium Fragrance"
+        
+        # Start with the product name (first part)
+        seo_title = title_parts[0]
+        
+        # Add other parts if they fit within the limit
+        for part in title_parts[1:]:
+            potential_title = f"{seo_title} | {part}"
+            if len(potential_title) <= max_length:
+                seo_title = potential_title
+            else:
+                break  # Stop adding parts if we exceed the limit
+        
+        return seo_title[:max_length].strip()
+    
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def optimize_description(self, 
-                           product_name: str,
-                           original_description: str,
-                           item_code: str) -> str:
+    def optimize_content(self, 
+                        product_name: str,
+                        original_description: str,
+                        item_code: str,
+                        title_parts: Optional[List[str]] = None) -> Dict[str, str]:
         """
-        Optimize product description for SEO and convert to Shopify-ready HTML
+        Optimize product content for SEO including description, title, and meta description
+        Returns dict with 'description_html', 'seo_title', 'meta_description'
         """
         if not original_description:
             original_description = "No description available"
         
-        prompt = f"""You are an expert e-commerce SEO copywriter. Transform the following product description into SEO-optimized, Shopify-ready HTML that will rank well and convert visitors into buyers.
+        # Create SEO title from provided parts or fallback to product name
+        if title_parts:
+            seo_title = self.create_seo_title(title_parts)
+        else:
+            seo_title = self.create_seo_title([product_name])
+        
+        prompt = f"""You are an expert e-commerce SEO copywriter. Create comprehensive SEO content for this product that will rank well and convert visitors.
 
 Product Name: {product_name}
+SEO Title: {seo_title}
 SKU/Item Code: {item_code}
 Original Description:
 {original_description}
 
-Requirements:
-1. Create compelling, SEO-friendly product description HTML
-2. Use proper HTML tags (h2, h3, p, ul, li, strong, em) - NO h1 tag
-3. Include relevant keywords naturally throughout
-4. Structure content with clear sections (Features, Benefits, Specifications if applicable)
-5. Write in an engaging, professional tone that builds trust
-6. Keep it concise but comprehensive (300-500 words ideal)
-7. Include a subtle call-to-action at the end
-8. Ensure mobile-friendly formatting with short paragraphs
-9. Use semantic HTML for better SEO
+Create the following content:
 
-Output only the HTML content, no markdown or explanations. Start directly with the HTML tags."""
+1. SEO-optimized product description in HTML format
+2. Meta description for search results (max 160 characters)
+
+Requirements for description HTML:
+- Use proper HTML tags (h2, h3, p, ul, li, strong, em) - NO h1 tag
+- Include relevant keywords naturally throughout
+- Structure content with clear sections including Top Notes, Middle Notes and Base Notes if applicable
+- Write in an engaging, professional tone that builds trust
+- Keep it concise but comprehensive (300-500 words ideal)
+- Ensure mobile-friendly formatting with short paragraphs
+- Use semantic HTML for better SEO
+
+Requirements for meta description:
+- Summarize key benefits and features
+- Include a call to action
+- Stay under 160 characters
+- Be compelling for search results
+
+Return your response as a JSON object with these exact keys:
+{{"description_html": "...", "meta_description": "..."}}
+
+Output only the JSON, no additional text or explanations.
+
+Don't even enclose the json in surrounding json block. Just start with the opening bracket directly
+"""
 
         try:
-            logger.info(f"Optimizing description for: {product_name}")
+            logger.info(f"Optimizing content for: {product_name}")
             
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are an expert e-commerce SEO copywriter. You output only HTML content."
+                        "content": "You are an expert e-commerce SEO copywriter. You output only JSON content."
                     },
                     {
                         "role": "user",
                         "content": prompt
                     }
                 ],
-                max_tokens=2000,
+                max_tokens=2500,
                 temperature=0.7
             )
             
-            optimized_html = response.choices[0].message.content.strip()
+            content = response.choices[0].message.content.strip()
             
-            # Basic validation
-            if not optimized_html or '<' not in optimized_html:
-                logger.warning("Invalid HTML response from ChatGPT, using fallback")
-                return self._create_fallback_html(product_name, original_description)
-            
-            logger.info(f"Successfully optimized description for {item_code}")
-            return optimized_html
+            # Parse JSON response
+            try:
+                print(content)
+                seo_content = json.loads(content)
+                # Validate required keys
+                required_keys = ['description_html', 'meta_description']
+                if not all(key in seo_content for key in required_keys):
+                    logger.warning("Missing keys in AI response, using fallback")
+                    return self._create_fallback_content(product_name, original_description, seo_title)
+                
+                # Basic validation
+                if not seo_content['description_html'] or '<' not in seo_content['description_html']:
+                    logger.warning("Invalid HTML in AI response, using fallback")
+                    return self._create_fallback_content(product_name, original_description, seo_title)
+                
+                # Add the SEO title to the response
+                seo_content['seo_title'] = seo_title
+                
+                logger.info(f"Successfully optimized content for {item_code}")
+                return seo_content
+                
+            except json.JSONDecodeError:
+                logger.warning("Invalid JSON response from AI, using fallback")
+                return self._create_fallback_content(product_name, original_description, seo_title)
             
         except Exception as e:
             logger.error(f"OpenAI API error: {e}")
-            return self._create_fallback_html(product_name, original_description)
+            return self._create_fallback_content(product_name, original_description, seo_title)
     
-    def _create_fallback_html(self, product_name: str, description: str) -> str:
-        """Create basic HTML if ChatGPT API fails"""
-        logger.info("Using fallback HTML generation")
+    def _create_fallback_content(self, product_name: str, description: str, seo_title: str) -> Dict[str, str]:
+        """Create fallback content if ChatGPT API fails"""
+        logger.info("Using fallback content generation")
         
         # Clean up description
         description = description.strip() if description else f"Discover the exceptional quality of {product_name}"
@@ -98,17 +158,31 @@ Output only the HTML content, no markdown or explanations. Start directly with t
     
     <h3>Why Choose This Product?</h3>
     <ul>
-        <li>Premium quality construction</li>
-        <li>Carefully selected materials</li>
+        <li>Alcohol-free</li>
+        <li>High-Quality Product from the heart of the Middle East</li>
         <li>Exceptional value</li>
         <li>Fast, reliable shipping</li>
     </ul>
     
-    <p><strong>Order your {product_name} today and experience the difference quality makes.</strong></p>
+    <p><strong>Order {product_name} today as a gift for yourself or a loved one.</strong></p>
 </div>
 """.strip()
         
-        return html
+        # Create fallback meta description
+        meta_description = f"Shop {product_name} Premium quality fragrance. Alcohol-free. Proudly Canadian. Shipping to only Canadians."
+        if len(meta_description) > 160:
+            meta_description = meta_description[:157] + "..."
+        
+        return {
+            "description_html": html,
+            "seo_title": seo_title,
+            "meta_description": meta_description
+        }
+
+    def _create_fallback_html(self, product_name: str, description: str) -> str:
+        """Create basic HTML if ChatGPT API fails (legacy method)"""
+        content = self._create_fallback_content(product_name, description, product_name)
+        return content["description_html"]
     
     def test_connection(self) -> bool:
         """Test the OpenAI API connection"""

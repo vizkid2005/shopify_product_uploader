@@ -73,6 +73,28 @@ class ImageManager:
             if save_path.exists():
                 save_path.unlink()
             return False
+
+    def download_image_for_item(self, url: str, item_code: str, filename: str) -> Optional[Path]:
+        """Download a single image for an item with specified filename"""
+        try:
+            item_dir = self.get_item_image_dir(item_code)
+            save_path = item_dir / filename
+            
+            # Check if already exists
+            if save_path.exists():
+                logger.debug(f"Image already exists: {save_path}")
+                return save_path
+            
+            if self.download_image(url, save_path):
+                logger.info(f"Downloaded image for {item_code}: {filename}")
+                return save_path
+            else:
+                logger.error(f"Failed to download image for {item_code}: {filename}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error downloading image for {item_code}: {e}")
+            return None
     
     def download_product_images(self, item_code: str, image_urls: List[str]) -> List[Path]:
         """

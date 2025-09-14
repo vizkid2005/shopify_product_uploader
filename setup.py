@@ -35,7 +35,6 @@ setup(
         "tenacity==9.0.0",
         "openai==1.35.0",
         "shopifyapi==12.5.0",
-        "frappe-client==1.2.0",
         "colorama==0.4.6",
         "tabulate==0.9.0",
         "jsonlines==4.0.0",

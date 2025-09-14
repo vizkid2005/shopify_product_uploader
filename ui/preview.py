@@ -23,7 +23,9 @@ class ProductPreview:
                        title: str,
                        description_html: str,
                        image_files: List[Path],
-                       competitor_url: str) -> None:
+                       competitor_url: str,
+                       seo_title: Optional[str] = None,
+                       meta_description: Optional[str] = None) -> None:
         """Display product preview to user"""
         
         print("\n" + "="*80)
@@ -37,6 +39,14 @@ class ProductPreview:
             ["Source URL", competitor_url],
             ["Images", f"{len(image_files)} files"]
         ]
+        
+        # Add SEO info if available
+        if seo_title:
+            info_data.append(["SEO Title", f"{Fore.MAGENTA}{seo_title}{Style.RESET_ALL}"])
+        if meta_description:
+            # Truncate meta description for display
+            meta_preview = meta_description[:60] + "..." if len(meta_description) > 60 else meta_description
+            info_data.append(["Meta Description", f"{Fore.CYAN}{meta_preview}{Style.RESET_ALL}"])
         
         print(tabulate(info_data, tablefmt="plain"))
         print()

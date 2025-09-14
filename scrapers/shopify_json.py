@@ -59,6 +59,9 @@ class ShopifyJsonScraper(BaseScraper):
             # Extract product name
             name = product.get('title', '')
             
+            # Extract Shopify handle
+            handle = product.get('handle', '')
+            
             # Extract description (may contain HTML)
             description = product.get('body_html', '') or product.get('description', '')
             
@@ -86,6 +89,7 @@ class ShopifyJsonScraper(BaseScraper):
                 name=name,
                 description=self.clean_description(description),
                 image_urls=image_urls,
+                handle=handle,
                 raw_data=product,
                 source='shopify_json'
             )

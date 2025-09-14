@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Shopify Product Uploader - Main CLI Application
-Uploads products from ERPNext to Shopify with SEO optimization
+ERPNext → Scraping → Processing → Shopify Pipeline
 """
 
 import sys
 import argparse
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
+from datetime import datetime
 
 from config.settings import settings
 from utils.logger import setup_logger, get_logger
@@ -16,22 +17,19 @@ from clients.shopify import ShopifyClient
 from scrapers.scraper import ProductScraper
 from services.image_manager import ImageManager
 from services.seo_optimizer import SEOOptimizer
-from services.state_manager import StateManager, ProcessStatus
 from services.rate_limiter import RateLimiter
 from ui.preview import ProductPreview
 
 logger = get_logger(__name__)
 
-class ProductUploader:
-    """Main orchestrator for product upload process"""
+class ProductPipeline:
+    """Main orchestrator for the product pipeline"""
     
-    def __init__(self, args):
-        self.args = args
-        self.dry_run = args.dry_run or settings.DRY_RUN
+    def __init__(self, dry_run: bool = False):
+        self.dry_run = dry_run
         
         # Initialize components
         self.ui = ProductPreview()
-        self.state_manager = StateManager()
         self.rate_limiter = RateLimiter()
         
         try:
@@ -58,328 +56,457 @@ class ProductUploader:
             return False
         
         if not self.seo_optimizer.test_connection():
-            self.ui.show_warning("ChatGPT API connection failed - will use fallback descriptions")
+            self.ui.show_warning("OpenAI API connection failed - will use fallback descriptions")
         
         self.ui.show_success("All connections successful")
         return True
     
-    def process_item(self, item) -> bool:
-        """Process a single ERPNext item"""
-        item_code = item.item_code
+    def scrape_items(self, item_code: Optional[str] = None, limit: Optional[int] = None) -> int:
+        """Scrape competitor data and store in ERPNext"""
+        self.ui.show_info("Starting scraping process...")
         
-        # Check if already processed
-        state = self.state_manager.get_product_state(item_code)
-        if state and state['status'] == ProcessStatus.UPLOADED.value:
-            logger.info(f"Skipping {item_code}: already uploaded")
-            return True
-        
-        # Check if exists in Shopify
-        if self.shopify.product_exists(item_code):
-            self.ui.show_info(f"Product {item_code} already exists in Shopify")
-            self.state_manager.update_product_state(
-                item_code, 
-                ProcessStatus.SKIPPED,
-                error_message="Already exists in Shopify"
-            )
-            return True
-        
-        try:
-            # Get competitor URL
-            competitor_url = item.get_priority_link()
-            if not competitor_url:
-                self.ui.show_warning(f"No competitor link for {item_code}")
-                self.state_manager.mark_failed(item_code, "No competitor links")
-                return False
-            
-            self.ui.show_info(f"Processing: {item_code} from {competitor_url}")
-            
-            # Rate limit before scraping
-            self.rate_limiter.wait()
-            
-            # Scrape product data
-            scraped_data = self.scraper.scrape(competitor_url)
-            if not scraped_data:
-                self.ui.show_error(f"Failed to scrape {competitor_url}")
-                self.state_manager.mark_failed(item_code, "Scraping failed")
-                return False
-            
-            self.state_manager.update_product_state(
-                item_code,
-                ProcessStatus.SCRAPED,
-                competitor_url=competitor_url,
-                product_name=scraped_data.name,
-                description=scraped_data.description,
-                image_urls=scraped_data.image_urls
-            )
-            
-            # Download images
-            self.ui.show_info(f"Downloading {len(scraped_data.image_urls)} images...")
-            image_files = self.image_manager.download_product_images(
-                item_code, 
-                scraped_data.image_urls
-            )
-            
-            if not image_files:
-                self.ui.show_error("No images downloaded")
-                self.state_manager.mark_failed(item_code, "No images downloaded")
-                return False
-            
-            self.state_manager.update_product_state(
-                item_code,
-                ProcessStatus.IMAGES_DOWNLOADED,
-                image_paths=[str(p) for p in image_files]
-            )
-            
-            # Optimize description with Claude
-            self.ui.show_info("Optimizing description with AI...")
-            optimized_description = self.seo_optimizer.optimize_description(
-                scraped_data.name,
-                scraped_data.description,
-                item_code
-            )
-            
-            self.state_manager.update_product_state(
-                item_code,
-                ProcessStatus.OPTIMIZED,
-                optimized_description=optimized_description
-            )
-            
-            # Show preview
-            self.ui.display_preview(
-                item_code,
-                scraped_data.name,
-                optimized_description,
-                image_files,
-                competitor_url
-            )
-            
-            # Get approval and price
-            if settings.APPROVAL_MODE == "auto":
-                approved = True
-                price = self.args.default_price or "99.99"
-                self.ui.show_info(f"Auto-approval mode: using price ${price}")
-            else:
-                # Check if user wants to edit description
-                if self.ui.ask_edit_description():
-                    optimized_description = self.ui.edit_description(optimized_description)
-                
-                approved, price = self.ui.get_approval_and_price()
-            
-            if not approved:
-                self.state_manager.update_product_state(
-                    item_code,
-                    ProcessStatus.SKIPPED,
-                    error_message="User rejected"
-                )
-                return True
-            
-            self.state_manager.update_product_state(
-                item_code,
-                ProcessStatus.APPROVED,
-                price=price
-            )
-            
-            # Upload to Shopify
-            if self.dry_run:
-                self.ui.show_info("DRY RUN: Would upload to Shopify")
-                self.ui.show_success(f"DRY RUN: Product {item_code} processed successfully")
-            else:
-                self.ui.show_info("Uploading to Shopify...")
-                
-                product = self.shopify.create_product(
-                    item_code=item_code,
-                    title=scraped_data.name,
-                    description_html=optimized_description,
-                    image_paths=image_files,
-                    price=price
-                )
-                
-                if product:
-                    self.state_manager.update_product_state(
-                        item_code,
-                        ProcessStatus.UPLOADED,
-                        shopify_product_id=product.get('id')
-                    )
-                    self.ui.show_success(f"Product {item_code} uploaded successfully!")
-                else:
-                    self.state_manager.mark_failed(item_code, "Upload to Shopify failed")
-                    return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error processing {item_code}: {e}", exc_info=True)
-            self.ui.show_error(f"Error processing {item_code}: {e}")
-            self.state_manager.mark_failed(item_code, str(e))
-            return False
-    
-    def run(self):
-        """Main execution flow"""
-        self.ui.show_info("Starting Shopify Product Uploader")
-        
-        # Validate settings
-        try:
-            settings.validate()
-        except ValueError as e:
-            self.ui.show_error(str(e))
-            sys.exit(1)
-        
-        # Test connections
         if not self.test_connections():
-            sys.exit(1)
+            return 0
         
-        # Show current statistics
-        stats = self.state_manager.get_statistics()
-        if stats.get('total', 0) > 0:
-            self.ui.show_info(f"Resuming from previous run: {stats}")
-        
-        # Process items
-        uploaded_count = 0
-        skipped_count = 0
-        failed_count = 0
+        success_count = 0
+        error_count = 0
         
         try:
-            # Get items based on mode
-            if self.args.item_code:
-                # Single item mode
-                item = self.erpnext.get_item_by_code(self.args.item_code)
+            # Get items to scrape
+            if item_code:
+                item = self.erpnext.get_item_by_code(item_code)
                 if not item:
-                    self.ui.show_error(f"Item {self.args.item_code} not found")
-                    sys.exit(1)
+                    self.ui.show_error(f"Item {item_code} not found")
+                    return 0
                 items = [item]
             else:
-                # Batch mode
-                items = self.erpnext.get_all_items(page_size=self.args.batch_size)
+                items = self.erpnext.get_all_items()
+                if limit:
+                    items = list(items)[:limit]
             
             for i, item in enumerate(items, 1):
-                if self.args.limit and i > self.args.limit:
-                    self.ui.show_info(f"Reached limit of {self.args.limit} items")
-                    break
+                self.ui.show_info(f"[{i}] Scraping: {item.item_code}")
                 
-                self.ui.show_info(f"\n[{i}] Processing item: {item.item_code}")
-                
-                success = self.process_item(item)
-                
-                if success:
-                    state = self.state_manager.get_product_state(item.item_code)
-                    if state['status'] == ProcessStatus.UPLOADED.value:
-                        uploaded_count += 1
+                try:
+                    # Get competitor URL
+                    competitor_url = item.get_priority_link()
+                    if not competitor_url:
+                        self.ui.show_warning(f"No competitor link for {item.item_code}")
+                        continue
+                    
+                    # Rate limit
+                    self.rate_limiter.wait()
+                    
+                    # Scrape product data
+                    scraped_data = self.scraper.scrape(competitor_url)
+                    if not scraped_data:
+                        self.ui.show_error(f"Failed to scrape {competitor_url}")
+                        error_count += 1
+                        continue
+                    
+                    # Prepare scraped data for ERPNext
+                    scraped_data_dict = {
+                        'images': [
+                            {
+                                'url': url,
+                                'filename': Path(url).name,
+                                'is_primary': i == 0,
+                                'source': competitor_url,
+                                'added_manually': False,
+                                'order': i + 1
+                            }
+                            for i, url in enumerate(scraped_data.image_urls)
+                        ],
+                        'description': scraped_data.description,
+                        'name': scraped_data.name,
+                        'handle': scraped_data.handle,  # Include scraped Shopify handle
+                        'source_url': competitor_url,
+                        'scrape_date': datetime.now().isoformat()
+                    }
+                    
+                    # Update ERPNext with scraped data
+                    if self.erpnext.update_scraped_data(item.item_code, scraped_data_dict, dry_run=self.dry_run):
+                        success_count += 1
+                        self.ui.show_success(f"Scraped {item.item_code}")
                     else:
-                        skipped_count += 1
-                else:
-                    failed_count += 1
+                        error_count += 1
+                        self.ui.show_error(f"Failed to update ERPNext for {item.item_code}")
                 
-                # Show running total
-                total = uploaded_count + skipped_count + failed_count
-                self.ui.show_info(
-                    f"Progress: {uploaded_count} uploaded, "
-                    f"{skipped_count} skipped, {failed_count} failed"
-                )
+                except Exception as e:
+                    logger.error(f"Error scraping {item.item_code}: {e}", exc_info=True)
+                    self.ui.show_error(f"Error scraping {item.item_code}: {e}")
+                    error_count += 1
         
         except KeyboardInterrupt:
-            self.ui.show_warning("\nProcess interrupted by user")
+            self.ui.show_warning("Scraping interrupted by user")
         except Exception as e:
-            logger.error(f"Fatal error: {e}", exc_info=True)
+            logger.error(f"Fatal error during scraping: {e}", exc_info=True)
             self.ui.show_error(f"Fatal error: {e}")
         
-        # Show final summary
-        self.ui.show_summary(uploaded_count, skipped_count, failed_count)
+        self.ui.show_info(f"Scraping complete: {success_count} success, {error_count} errors")
+        return success_count
+    
+    def process_items(self, item_code: Optional[str] = None, content_status: str = "Draft", limit: Optional[int] = None) -> int:
+        """Process scraped data with AI optimization"""
+        self.ui.show_info("Starting processing...")
         
-        # Export state for backup
-        if self.args.export_state:
-            export_path = Path(self.args.export_state)
-            self.state_manager.export_to_jsonl(export_path)
-            self.ui.show_info(f"State exported to {export_path}")
+        success_count = 0
+        error_count = 0
+        
+        try:
+            # Get items to process
+            if item_code:
+                item = self.erpnext.get_item_by_code(item_code)
+                if not item:
+                    self.ui.show_error(f"Item {item_code} not found")
+                    return 0
+                items = [item]
+            else:
+                items = self.erpnext.get_items_by_status(content_status=content_status, limit=limit)
+            
+            for i, item in enumerate(items, 1):
+                self.ui.show_info(f"[{i}] Processing: {item.item_code}")
+                
+                try:
+                    # Get SEO title parts
+                    title_parts = item.get_seo_title_parts()
+                    
+                    # Optimize content with AI
+                    seo_content = self.seo_optimizer.optimize_content(
+                        item.scraped_name or item.shopify_product_name,
+                        item.scraped_description or '',
+                        item.item_code,
+                        title_parts=title_parts
+                    )
+                    
+                    # Add scraped data to processed data for field population
+                    processed_data = seo_content.copy()
+                    
+                    # Populate handle field if empty
+                    if not item.shopify_product_handle and item.scraped_handle:
+                        processed_data['product_handle'] = item.scraped_handle
+                    
+                    # Populate name field if empty
+                    if not item.shopify_product_name and item.scraped_name:
+                        processed_data['product_name'] = item.scraped_name
+                    
+                    # Update ERPNext with processed data
+                    if self.erpnext.update_processed_data(item.item_code, processed_data, dry_run=self.dry_run):
+                        success_count += 1
+                        self.ui.show_success(f"Processed {item.item_code}")
+                    else:
+                        error_count += 1
+                        self.ui.show_error(f"Failed to update processed data for {item.item_code}")
+                
+                except Exception as e:
+                    logger.error(f"Error processing {item.item_code}: {e}", exc_info=True)
+                    self.ui.show_error(f"Error processing {item.item_code}: {e}")
+                    error_count += 1
+        
+        except KeyboardInterrupt:
+            self.ui.show_warning("Processing interrupted by user")
+        except Exception as e:
+            logger.error(f"Fatal error during processing: {e}", exc_info=True)
+            self.ui.show_error(f"Fatal error: {e}")
+        
+        self.ui.show_info(f"Processing complete: {success_count} success, {error_count} errors")
+        return success_count
+    
+    def upload_items(self, item_code: Optional[str] = None, content_status: str = "Processed", limit: Optional[int] = None) -> int:
+        """Upload processed items to Shopify"""
+        self.ui.show_info("Starting Shopify upload...")
+        
+        if not self.test_connections():
+            return 0
+        
+        success_count = 0
+        error_count = 0
+        
+        try:
+            # Get items to upload
+            if item_code:
+                item = self.erpnext.get_item_by_code(item_code)
+                if not item:
+                    self.ui.show_error(f"Item {item_code} not found")
+                    return 0
+                items = [item]
+            else:
+                items = self.erpnext.get_items_by_status(content_status=content_status, limit=limit)
+            
+            for i, item in enumerate(items, 1):
+                self.ui.show_info(f"[{i}] Uploading: {item.item_code}")
+                
+                try:
+                    # Check if already exists in Shopify
+                    existing_product = self.shopify.get_existing_product(item.shopify_product_handle, item.item_code)
+                    logger.info(existing_product)
+                    is_update = existing_product is not None
+                    
+                    # Download images from JSON
+                    image_files = []
+                    if item.scraped_images:
+                        self.ui.show_info(f"Downloading {len(item.scraped_images)} images...")
+                        for img_data in item.scraped_images:
+                            try:
+                                # Download image from URL
+                                image_path = self.image_manager.download_image_for_item(
+                                    img_data['url'], 
+                                    item.item_code,
+                                    img_data.get('filename', Path(img_data['url']).name)
+                                )
+                                if image_path:
+                                    image_files.append(image_path)
+                            except Exception as e:
+                                logger.warning(f"Failed to download image {img_data['url']}: {e}")
+                    
+                    if not image_files:
+                        self.ui.show_warning(f"No images downloaded for {item.item_code}")
+                        self.erpnext.update_sync_status(item.item_code, "Error", dry_run=self.dry_run)
+                        error_count += 1
+                        continue
+                    
+                    # Show preview and get approval
+                    if not self.dry_run:
+                        action_text = "UPDATE" if is_update else "CREATE"
+                        self.ui.show_info(f"Action: {action_text} product in Shopify")
+                        
+                        self.ui.display_preview(
+                            item.item_code,
+                            item.shopify_product_name,
+                            item.shopify_description_html or "No description",
+                            image_files,
+                            item.scrape_source_url or "",
+                            seo_title=item.shopify_seo_title,
+                            meta_description=item.shopify_meta_description
+                        )
+                        
+                        approved, price = self.ui.get_approval_and_price()
+                        if not approved:
+                            self.ui.show_info(f"Upload rejected for {item.item_code}")
+                            continue
+                    else:
+                        price = "99.99"  # Default price for dry run
+                    
+                    # Create or update product in Shopify
+                    if is_update:
+                        # Extract product ID from existing product
+                        product_id = existing_product['id']
+                        
+                        product = self.shopify.update_product(
+                            product_id=product_id,
+                            item_code=item.item_code,
+                            title=item.shopify_product_name,
+                            description_html=item.shopify_description_html or "",
+                            image_paths=image_files,
+                            price=price,
+                            handle=item.shopify_product_handle,
+                            seo_title=item.shopify_seo_title,
+                            meta_description=item.shopify_meta_description
+                        )
+                        action_text = "updated"
+                    else:
+                        product = self.shopify.create_product(
+                            item_code=item.item_code,
+                            title=item.shopify_product_name,
+                            description_html=item.shopify_description_html or "",
+                            image_paths=image_files,
+                            price=price,
+                            handle=item.shopify_product_handle,
+                            seo_title=item.shopify_seo_title,
+                            meta_description=item.shopify_meta_description
+                        )
+                        action_text = "created"
+                    
+                    if product:
+                        self.erpnext.update_sync_status(
+                            item.item_code, 
+                            "Synced", 
+                            product.get('id'),
+                            dry_run=self.dry_run
+                        )
+                        success_count += 1
+                        self.ui.show_success(f"Successfully {action_text} {item.item_code} in Shopify")
+                    else:
+                        self.erpnext.update_sync_status(item.item_code, "Error", dry_run=self.dry_run)
+                        error_count += 1
+                        self.ui.show_error(f"Failed to {action_text.split()[0]} {item.item_code}")
+                
+                except Exception as e:
+                    logger.error(f"Error uploading {item.item_code}: {e}", exc_info=True)
+                    self.ui.show_error(f"Error uploading {item.item_code}: {e}")
+                    self.erpnext.update_sync_status(item.item_code, "Error", dry_run=self.dry_run)
+                    error_count += 1
+        
+        except KeyboardInterrupt:
+            self.ui.show_warning("Upload interrupted by user")
+        except Exception as e:
+            logger.error(f"Fatal error during upload: {e}", exc_info=True)
+            self.ui.show_error(f"Fatal error: {e}")
+        
+        self.ui.show_info(f"Upload complete: {success_count} success, {error_count} errors")
+        return success_count
+    
+    def run_pipeline(self, item_code: Optional[str] = None, limit: Optional[int] = None) -> bool:
+        """Run full pipeline: scrape → process → upload"""
+        self.ui.show_info("Starting full pipeline...")
+        
+        # Step 1: Scrape
+        scraped = self.scrape_items(item_code, limit)
+        if scraped == 0:
+            self.ui.show_error("No items scraped, stopping pipeline")
+            return False
+        
+        # Step 2: Process
+        processed = self.process_items(item_code, "Draft", limit)
+        if processed == 0:
+            self.ui.show_error("No items processed, stopping pipeline")
+            return False
+        
+        # Step 3: Upload
+        uploaded = self.upload_items(item_code, "Processed", limit)
+        
+        self.ui.show_success(f"Pipeline complete: {scraped} scraped, {processed} processed, {uploaded} uploaded")
+        return uploaded > 0
+    
+    def show_status(self, item_code: Optional[str] = None, detailed: bool = False) -> None:
+        """Show current pipeline status"""
+        self.ui.show_info("Pipeline Status")
+        
+        if item_code:
+            # Show single item status
+            item = self.erpnext.get_item_by_code(item_code)
+            if not item:
+                self.ui.show_error(f"Item {item_code} not found")
+                return
+            
+            self.ui.show_info(f"Item: {item.item_code}")
+            self.ui.show_info(f"  Content Status: {item.content_status or 'None'}")
+            self.ui.show_info(f"  Sync Status: {item.shopify_sync_status or 'None'}")
+            self.ui.show_info(f"  Last Sync: {item.last_shopify_sync or 'Never'}")
+            if item.scraped_images:
+                self.ui.show_info(f"  Images: {len(item.scraped_images)}")
+            if item.shopify_product_id:
+                self.ui.show_info(f"  Shopify ID: {item.shopify_product_id}")
+        else:
+            # Show overall statistics
+            stats = {}
+            
+            # Get counts by content status
+            for status in ["Draft", "Processed", "Approved"]:
+                count = len(list(self.erpnext.get_items_by_status(content_status=status, limit=1000)))
+                stats[f"Content {status}"] = count
+            
+            # Get counts by sync status  
+            for status in ["Pending", "Synced", "Error", "Skipped"]:
+                count = len(list(self.erpnext.get_items_by_status(sync_status=status, limit=1000)))
+                stats[f"Sync {status}"] = count
+            
+            self.ui.show_info("Overall Statistics:")
+            for status, count in stats.items():
+                self.ui.show_info(f"  {status}: {count}")
 
 def main():
     """CLI entry point"""
     parser = argparse.ArgumentParser(
-        description="Upload products from ERPNext to Shopify with SEO optimization",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="ERPNext → Shopify Product Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  scrape    Scrape competitor data into ERPNext
+  process   Process scraped data with AI optimization  
+  upload    Upload processed products to Shopify
+  pipeline  Run full scrape → process → upload pipeline
+  status    Show pipeline status and statistics
+
+Examples:
+  %(prog)s scrape --limit 10 --dry-run
+  %(prog)s process --status Draft --limit 5
+  %(prog)s upload --status Processed
+  %(prog)s pipeline --item-code ITEM-001
+  %(prog)s status --item-code ITEM-001 --detailed
+        """
     )
     
-    parser.add_argument(
-        '--item-code',
-        help='Process a single item by code'
-    )
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would be done without making changes')
+    parser.add_argument('--item-code', 
+                        help='Process a single item by code')
+    parser.add_argument('--limit', type=int,
+                        help='Maximum number of items to process')
     
-    parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=100,
-        help='Number of items per batch (default: 100)'
-    )
+    # Create subparsers
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
-    parser.add_argument(
-        '--limit',
-        type=int,
-        help='Maximum number of items to process'
-    )
+    # Scrape command
+    scrape_parser = subparsers.add_parser('scrape', help='Scrape competitor data into ERPNext')
+    scrape_parser.add_argument('--item-code', help='Scrape a single item')
+    scrape_parser.add_argument('--limit', type=int, help='Maximum items to scrape')
+    scrape_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
     
-    parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Run without actually uploading to Shopify'
-    )
+    # Process command
+    process_parser = subparsers.add_parser('process', help='Process scraped data with AI')
+    process_parser.add_argument('--item-code', help='Process a single item')
+    process_parser.add_argument('--status', default='Draft', help='Content status to process (default: Draft)')
+    process_parser.add_argument('--limit', type=int, help='Maximum items to process')
+    process_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
     
-    parser.add_argument(
-        '--default-price',
-        help='Default price for auto-approval mode'
-    )
+    # Upload command
+    upload_parser = subparsers.add_parser('upload', help='Upload processed products to Shopify')
+    upload_parser.add_argument('--item-code', help='Upload a single item')
+    upload_parser.add_argument('--status', default='Processed', help='Content status to upload (default: Processed)')
+    upload_parser.add_argument('--limit', type=int, help='Maximum items to upload')
+    upload_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
     
-    parser.add_argument(
-        '--export-state',
-        help='Export final state to JSONL file'
-    )
+    # Pipeline command
+    pipeline_parser = subparsers.add_parser('pipeline', help='Run full scrape → process → upload pipeline')
+    pipeline_parser.add_argument('--item-code', help='Run pipeline for single item')
+    pipeline_parser.add_argument('--limit', type=int, help='Maximum items to process')
+    pipeline_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
     
-    parser.add_argument(
-        '--reset-item',
-        help='Reset a specific item to pending status'
-    )
-    
-    parser.add_argument(
-        '--clear-cache',
-        action='store_true',
-        help='Clear all cached images'
-    )
-    
-    parser.add_argument(
-        '--stats',
-        action='store_true',
-        help='Show statistics and exit'
-    )
+    # Status command
+    status_parser = subparsers.add_parser('status', help='Show pipeline status')
+    status_parser.add_argument('--item-code', help='Show status for single item')
+    status_parser.add_argument('--detailed', action='store_true', help='Show detailed information')
     
     args = parser.parse_args()
     
-    # Handle special commands
-    if args.stats:
-        state_manager = StateManager()
-        stats = state_manager.get_statistics()
-        print("Processing Statistics:")
-        for status, count in stats.items():
-            print(f"  {status}: {count}")
-        sys.exit(0)
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
     
-    if args.reset_item:
-        state_manager = StateManager()
-        state_manager.reset_item(args.reset_item)
-        print(f"Reset {args.reset_item} to pending")
-        sys.exit(0)
+    # Validate settings
+    try:
+        settings.validate()
+    except ValueError as e:
+        print(f"Configuration error: {e}")
+        sys.exit(1)
     
-    if args.clear_cache:
-        image_manager = ImageManager()
-        size, count = image_manager.get_cache_size()
-        print(f"Cache size: {size:,} bytes in {count} files")
-        confirm = input("Clear cache? [y/N]: ").strip().lower()
-        if confirm in ['y', 'yes']:
-            import shutil
-            shutil.rmtree(settings.IMAGE_DIR)
-            print("Cache cleared")
-        sys.exit(0)
+    # Initialize pipeline
+    pipeline = ProductPipeline(dry_run=args.dry_run)
     
-    # Run main application
-    uploader = ProductUploader(args)
-    uploader.run()
+    # Execute command
+    try:
+        if args.command == 'scrape':
+            pipeline.scrape_items(args.item_code, args.limit)
+        elif args.command == 'process':
+            pipeline.process_items(args.item_code, args.status, args.limit)
+        elif args.command == 'upload':
+            pipeline.upload_items(args.item_code, args.status, args.limit)
+        elif args.command == 'pipeline':
+            pipeline.run_pipeline(args.item_code, args.limit)
+        elif args.command == 'status':
+            pipeline.show_status(args.item_code, args.detailed)
+        else:
+            parser.print_help()
+            sys.exit(1)
+            
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        print(f"Fatal error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
