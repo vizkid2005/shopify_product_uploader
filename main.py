@@ -198,7 +198,7 @@ class ProductPipeline:
         self.ui.show_info(f"Scraping complete: {success_count} success, {error_count} errors")
         return success_count
     
-    def process_items(self, item_code: Optional[str] = None, content_status: str = "Scraped", limit: Optional[int] = None) -> int:
+    def process_items(self, item_code: Optional[str] = None, content_status: str = "Scraped", limit: Optional[int] = None, auto_approve: bool = False) -> int:
         """Process scraped data with AI optimization"""
         self.ui.show_info("Starting processing...")
         
@@ -253,20 +253,25 @@ class ProductPipeline:
                             self.ui.show_info(f"Meta Description: {seo_content.get('meta_description', 'N/A')[:100]}...")
                             self.ui.show_info(f"Description: {seo_content.get('description_html', 'N/A')[:200]}...")
 
-                            # Ask for approval
-                            while True:
-                                response = input("\nApprove this processed content? (y/n/q): ").strip().lower()
-                                if response == 'y':
-                                    approved = True
-                                    break
-                                elif response == 'n':
-                                    approved = False
-                                    break
-                                elif response == 'q':
-                                    self.ui.show_info("Processing cancelled by user")
-                                    return success_count
-                                else:
-                                    print("Please enter y (approve), n (keep as processed for later review), or q (quit)")
+                            # Determine approval based on auto_approve flag
+                            if auto_approve:
+                                approved = True
+                                self.ui.show_info("Auto-approving processed content...")
+                            else:
+                                # Ask for approval
+                                while True:
+                                    response = input("\nApprove this processed content? (y/n/q): ").strip().lower()
+                                    if response == 'y':
+                                        approved = True
+                                        break
+                                    elif response == 'n':
+                                        approved = False
+                                        break
+                                    elif response == 'q':
+                                        self.ui.show_info("Processing cancelled by user")
+                                        return success_count
+                                    else:
+                                        print("Please enter y (approve), n (keep as processed for later review), or q (quit)")
 
                             # Update approval status
                             if self.erpnext.update_approval_status(item.item_code, approved, dry_run=self.dry_run):
@@ -513,6 +518,7 @@ Commands:
 Examples:
   %(prog)s scrape --limit 10 --dry-run
   %(prog)s process --status Scraped --limit 5
+  %(prog)s process --status Scraped --auto-approve
   %(prog)s upload --status Approved
   %(prog)s pipeline --item-code ITEM-001
   %(prog)s status --item-code ITEM-001 --detailed
@@ -540,6 +546,7 @@ Examples:
     process_parser.add_argument('--item-code', help='Process a single item')
     process_parser.add_argument('--status', default='Scraped', help='Content status to process (default: Scraped)')
     process_parser.add_argument('--limit', type=int, help='Maximum items to process')
+    process_parser.add_argument('--auto-approve', action='store_true', help='Automatically approve all processed items without prompting')
     process_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
     
     # Upload command
@@ -581,7 +588,7 @@ Examples:
         if args.command == 'scrape':
             pipeline.scrape_items(args.item_code, args.limit)
         elif args.command == 'process':
-            pipeline.process_items(args.item_code, args.status, args.limit)
+            pipeline.process_items(args.item_code, args.status, args.limit, args.auto_approve)
         elif args.command == 'upload':
             pipeline.upload_items(args.item_code, args.status, args.limit)
         elif args.command == 'pipeline':
