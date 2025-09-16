@@ -348,7 +348,7 @@ class ERPNextClient:
                 "custom_scraped_handle": scraped_data.get('handle', ''),
                 "custom_scrape_source_url": scraped_data.get('source_url', ''),
                 "custom_scrape_date": scraped_data.get('scrape_date', ''),
-                "custom_content_status": "Draft"
+                "custom_content_status": "Scraped"
             }
             
             response = self.session.put(url, json=update_data)
@@ -401,6 +401,32 @@ class ERPNextClient:
             logger.error(f"Error updating processed data for {item_code}: {e}")
             return False
 
+    def update_approval_status(self, item_code: str, approved: bool, dry_run: bool = False) -> bool:
+        """Update content status to Approved or keep as Processed"""
+        status = "Approved" if approved else "Processed"
+
+        if dry_run:
+            logger.info(f"DRY RUN: Would update content status for {item_code} to '{status}'")
+            return True
+
+        try:
+            url = f"{self.base_url}Item/{item_code}"
+
+            # Prepare update data
+            update_data = {
+                "custom_content_status": status
+            }
+
+            response = self.session.put(url, json=update_data)
+            response.raise_for_status()
+
+            logger.info(f"Successfully updated content status for {item_code} to '{status}'")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error updating approval status for {item_code}: {e}")
+            return False
+
     def update_sync_status(self, item_code: str, status: str, shopify_product_id: Optional[str] = None, dry_run: bool = False) -> bool:
         """Update Shopify sync status in ERPNext"""
         if dry_run:
@@ -411,25 +437,57 @@ class ERPNextClient:
 
         try:
             url = f"{self.base_url}Item/{item_code}"
-            
+
             # Prepare update data
             from datetime import datetime
             update_data = {
                 "custom_shopify_sync_status": status,
                 "custom_last_shopify_sync": datetime.now().isoformat()
             }
-            
+
             if shopify_product_id:
                 update_data["custom_shopify_product_id"] = shopify_product_id
-            
+
             response = self.session.put(url, json=update_data)
             response.raise_for_status()
-            
+
             logger.info(f"Successfully updated sync status for {item_code} to '{status}'")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error updating sync status for {item_code}: {e}")
+            return False
+
+    def update_synchronized_status(self, item_code: str, shopify_product_id: Optional[str] = None, dry_run: bool = False) -> bool:
+        """Update content status to Synchronized after successful upload"""
+        if dry_run:
+            logger.info(f"DRY RUN: Would update content status for {item_code} to 'Synchronized'")
+            if shopify_product_id:
+                logger.info(f"Shopify product ID: {shopify_product_id}")
+            return True
+
+        try:
+            url = f"{self.base_url}Item/{item_code}"
+
+            # Prepare update data
+            from datetime import datetime
+            update_data = {
+                "custom_content_status": "Synchronized",
+                "custom_shopify_sync_status": "Synced",
+                "custom_last_shopify_sync": datetime.now().isoformat()
+            }
+
+            if shopify_product_id:
+                update_data["custom_shopify_product_id"] = shopify_product_id
+
+            response = self.session.put(url, json=update_data)
+            response.raise_for_status()
+
+            logger.info(f"Successfully updated content status for {item_code} to 'Synchronized'")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error updating synchronized status for {item_code}: {e}")
             return False
 
     def get_items_by_status(self, content_status: Optional[str] = None, 

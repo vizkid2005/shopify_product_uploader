@@ -7,7 +7,7 @@ ERPNext → Scraping → Processing → Shopify Pipeline
 import sys
 import argparse
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime
 
 from config.settings import settings
@@ -42,7 +42,43 @@ class ProductPipeline:
             logger.error(f"Failed to initialize components: {e}")
             self.ui.show_error(f"Initialization failed: {e}")
             sys.exit(1)
-    
+
+    def _filter_images_for_upload(self, images: List[Dict], source_url: Optional[str]) -> List[Dict]:
+        """
+        Filter images for upload, excluding PNG images containing '26' in filename from ourascents products.
+
+        Args:
+            images: List of image dictionaries with 'url' and 'filename' keys
+            source_url: The source URL the images were scraped from
+
+        Returns:
+            Filtered list of images
+        """
+        if not source_url or 'ourascents.com' not in source_url:
+            # Not from ourascents, return all images
+            return images
+
+        filtered_images = []
+        for img_data in images:
+            filename = img_data.get('filename', '')
+            url = img_data.get('url', '')
+
+            # Extract filename from URL if not provided
+            if not filename:
+                filename = Path(url).name
+
+            # Check if it's a PNG image containing '26' in the filename
+            is_png = filename.lower().endswith('.png')
+            contains_26 = '26' in filename
+
+            if is_png and contains_26:
+                logger.info(f"Skipping ourascents PNG image with '26' in filename: {filename}")
+                continue
+
+            filtered_images.append(img_data)
+
+        return filtered_images
+
     def test_connections(self) -> bool:
         """Test all API connections"""
         self.ui.show_info("Testing connections...")
@@ -72,17 +108,33 @@ class ProductPipeline:
         error_count = 0
         
         try:
-            # Get items to scrape
+            # Get items to scrape - only process items that haven't been scraped yet
             if item_code:
                 item = self.erpnext.get_item_by_code(item_code)
                 if not item:
                     self.ui.show_error(f"Item {item_code} not found")
                     return 0
+
+                # Check if item needs scraping
+                if item.content_status in ["Scraped", "Processed", "Approved", "Synchronized"]:
+                    self.ui.show_info(f"Item {item_code} already has status '{item.content_status}' - skipping scrape")
+                    return 0
+
                 items = [item]
             else:
-                items = self.erpnext.get_all_items()
+                # Get all items and filter out those already scraped
+                all_items = self.erpnext.get_all_items()
+                items = []
+                for item in all_items:
+                    if item.content_status not in ["Scraped", "Processed", "Approved", "Synchronized"]:
+                        items.append(item)
+                    else:
+                        logger.debug(f"Skipping {item.item_code} - already {item.content_status}")
+
                 if limit:
-                    items = list(items)[:limit]
+                    items = items[:limit]
+
+                self.ui.show_info(f"Found {len(items)} items ready for scraping")
             
             for i, item in enumerate(items, 1):
                 self.ui.show_info(f"[{i}] Scraping: {item.item_code}")
@@ -146,7 +198,7 @@ class ProductPipeline:
         self.ui.show_info(f"Scraping complete: {success_count} success, {error_count} errors")
         return success_count
     
-    def process_items(self, item_code: Optional[str] = None, content_status: str = "Draft", limit: Optional[int] = None) -> int:
+    def process_items(self, item_code: Optional[str] = None, content_status: str = "Scraped", limit: Optional[int] = None) -> int:
         """Process scraped data with AI optimization"""
         self.ui.show_info("Starting processing...")
         
@@ -192,8 +244,43 @@ class ProductPipeline:
                     
                     # Update ERPNext with processed data
                     if self.erpnext.update_processed_data(item.item_code, processed_data, dry_run=self.dry_run):
+                        # Show preview and ask for approval
+                        if not self.dry_run:
+                            self.ui.show_info("--- Processing Preview ---")
+                            self.ui.show_info(f"Item Code: {item.item_code}")
+                            self.ui.show_info(f"Product Name: {item.scraped_name or item.shopify_product_name}")
+                            self.ui.show_info(f"SEO Title: {seo_content.get('seo_title', 'N/A')}")
+                            self.ui.show_info(f"Meta Description: {seo_content.get('meta_description', 'N/A')[:100]}...")
+                            self.ui.show_info(f"Description: {seo_content.get('description_html', 'N/A')[:200]}...")
+
+                            # Ask for approval
+                            while True:
+                                response = input("\nApprove this processed content? (y/n/q): ").strip().lower()
+                                if response == 'y':
+                                    approved = True
+                                    break
+                                elif response == 'n':
+                                    approved = False
+                                    break
+                                elif response == 'q':
+                                    self.ui.show_info("Processing cancelled by user")
+                                    return success_count
+                                else:
+                                    print("Please enter y (approve), n (keep as processed for later review), or q (quit)")
+
+                            # Update approval status
+                            if self.erpnext.update_approval_status(item.item_code, approved, dry_run=self.dry_run):
+                                status_text = "Approved" if approved else "Processed (pending approval)"
+                                self.ui.show_success(f"Processed {item.item_code} - {status_text}")
+                            else:
+                                self.ui.show_error(f"Failed to update approval status for {item.item_code}")
+                                error_count += 1
+                                continue
+                        else:
+                            # In dry run mode, assume approved
+                            self.ui.show_success(f"Processed {item.item_code} (dry run)")
+
                         success_count += 1
-                        self.ui.show_success(f"Processed {item.item_code}")
                     else:
                         error_count += 1
                         self.ui.show_error(f"Failed to update processed data for {item.item_code}")
@@ -212,7 +299,7 @@ class ProductPipeline:
         self.ui.show_info(f"Processing complete: {success_count} success, {error_count} errors")
         return success_count
     
-    def upload_items(self, item_code: Optional[str] = None, content_status: str = "Processed", limit: Optional[int] = None) -> int:
+    def upload_items(self, item_code: Optional[str] = None, content_status: str = "Approved", limit: Optional[int] = None) -> int:
         """Upload processed items to Shopify"""
         self.ui.show_info("Starting Shopify upload...")
         
@@ -245,12 +332,18 @@ class ProductPipeline:
                     # Download images from JSON
                     image_files = []
                     if item.scraped_images:
-                        self.ui.show_info(f"Downloading {len(item.scraped_images)} images...")
-                        for img_data in item.scraped_images:
+                        # Filter images for ourascents products
+                        filtered_images = self._filter_images_for_upload(item.scraped_images, item.scrape_source_url)
+                        if len(filtered_images) < len(item.scraped_images):
+                            skipped_count = len(item.scraped_images) - len(filtered_images)
+                            self.ui.show_info(f"Skipped {skipped_count} ourascents PNG images containing '26' in filename")
+
+                        self.ui.show_info(f"Downloading {len(filtered_images)} images...")
+                        for img_data in filtered_images:
                             try:
                                 # Download image from URL
                                 image_path = self.image_manager.download_image_for_item(
-                                    img_data['url'], 
+                                    img_data['url'],
                                     item.item_code,
                                     img_data.get('filename', Path(img_data['url']).name)
                                 )
@@ -318,14 +411,13 @@ class ProductPipeline:
                         action_text = "created"
                     
                     if product:
-                        self.erpnext.update_sync_status(
-                            item.item_code, 
-                            "Synced", 
+                        self.erpnext.update_synchronized_status(
+                            item.item_code,
                             product.get('id'),
                             dry_run=self.dry_run
                         )
                         success_count += 1
-                        self.ui.show_success(f"Successfully {action_text} {item.item_code} in Shopify")
+                        self.ui.show_success(f"Successfully {action_text} {item.item_code} in Shopify - Status: Synchronized")
                     else:
                         self.erpnext.update_sync_status(item.item_code, "Error", dry_run=self.dry_run)
                         error_count += 1
@@ -357,13 +449,13 @@ class ProductPipeline:
             return False
         
         # Step 2: Process
-        processed = self.process_items(item_code, "Draft", limit)
+        processed = self.process_items(item_code, "Scraped", limit)
         if processed == 0:
             self.ui.show_error("No items processed, stopping pipeline")
             return False
         
         # Step 3: Upload
-        uploaded = self.upload_items(item_code, "Processed", limit)
+        uploaded = self.upload_items(item_code, "Approved", limit)
         
         self.ui.show_success(f"Pipeline complete: {scraped} scraped, {processed} processed, {uploaded} uploaded")
         return uploaded > 0
@@ -392,7 +484,7 @@ class ProductPipeline:
             stats = {}
             
             # Get counts by content status
-            for status in ["Draft", "Processed", "Approved"]:
+            for status in ["Scraped", "Processed", "Approved", "Synchronized"]:
                 count = len(list(self.erpnext.get_items_by_status(content_status=status, limit=1000)))
                 stats[f"Content {status}"] = count
             
@@ -420,8 +512,8 @@ Commands:
 
 Examples:
   %(prog)s scrape --limit 10 --dry-run
-  %(prog)s process --status Draft --limit 5
-  %(prog)s upload --status Processed
+  %(prog)s process --status Scraped --limit 5
+  %(prog)s upload --status Approved
   %(prog)s pipeline --item-code ITEM-001
   %(prog)s status --item-code ITEM-001 --detailed
         """
@@ -446,14 +538,14 @@ Examples:
     # Process command
     process_parser = subparsers.add_parser('process', help='Process scraped data with AI')
     process_parser.add_argument('--item-code', help='Process a single item')
-    process_parser.add_argument('--status', default='Draft', help='Content status to process (default: Draft)')
+    process_parser.add_argument('--status', default='Scraped', help='Content status to process (default: Scraped)')
     process_parser.add_argument('--limit', type=int, help='Maximum items to process')
     process_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
     
     # Upload command
     upload_parser = subparsers.add_parser('upload', help='Upload processed products to Shopify')
     upload_parser.add_argument('--item-code', help='Upload a single item')
-    upload_parser.add_argument('--status', default='Processed', help='Content status to upload (default: Processed)')
+    upload_parser.add_argument('--status', default='Approved', help='Content status to upload (default: Approved)')
     upload_parser.add_argument('--limit', type=int, help='Maximum items to upload')
     upload_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
     

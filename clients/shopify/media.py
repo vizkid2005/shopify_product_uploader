@@ -136,7 +136,7 @@ class MediaManager:
 
             files.append({
                 "originalSource": staged_target.get('resourceUrl'),
-                "alt": f"Product image: {image_path.stem}",
+                "alt": product_data.get('title', f"Product image: {image_path.stem}"),
                 "filename": image_path.name,
                 "contentType": "IMAGE"
             })
@@ -200,7 +200,7 @@ class MediaManager:
         return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def update_product_media(self, product_id: str, image_paths: List[Path]) -> List[Dict[str, Any]]:
+    def update_product_media(self, product_id: str, image_paths: List[Path], product_title: str = None) -> List[Dict[str, Any]]:
         """
         Update existing product with new media using the modern productUpdate mutation.
         Returns list of updated media objects.
@@ -229,7 +229,7 @@ class MediaManager:
 
             media.append({
                 "originalSource": staged_target.get('resourceUrl'),
-                "alt": f"Product image: {image_path.stem}",
+                "alt": product_title or f"Product image: {image_path.stem}",
                 "mediaContentType": "IMAGE"
             })
 
@@ -279,14 +279,14 @@ class MediaManager:
         return []
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def upload_product_media(self, product_id: str, image_paths: List[Path]) -> List[Dict[str, Any]]:
+    def upload_product_media(self, product_id: str, image_paths: List[Path], product_title: str = None) -> List[Dict[str, Any]]:
         """
         Upload media files for a product. Uses productUpdate for existing products.
         Returns list of created/updated media objects.
 
         This method maintains backwards compatibility while using modern Shopify APIs.
         """
-        return self.update_product_media(product_id, image_paths)
+        return self.update_product_media(product_id, image_paths, product_title)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def delete_existing_media(self, product_id: str) -> bool:
@@ -352,7 +352,7 @@ class MediaManager:
         return True
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def replace_product_media(self, product_id: str, image_paths: List[Path]) -> List[Dict[str, Any]]:
+    def replace_product_media(self, product_id: str, image_paths: List[Path], product_title: str = None) -> List[Dict[str, Any]]:
         """
         Replace all existing media for a product with new images.
         This is more efficient than delete + create as it does both in one operation.
@@ -366,7 +366,7 @@ class MediaManager:
             logger.warning("Failed to delete existing media, proceeding with update anyway")
 
         # Then add new media
-        return self.update_product_media(product_id, image_paths)
+        return self.update_product_media(product_id, image_paths, product_title)
 
     def get_product_media(self, product_id: str) -> List[Dict[str, Any]]:
         """

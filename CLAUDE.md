@@ -21,7 +21,7 @@ Write a **Python 3.11** CLI tool that:
    - **Price** (required to proceed)
    - Optional: edit the description in $EDITOR before upload
 8. Provide robust logging, resumability, and rate limiting.
-9. Use the latest Shopify API docs from https://shopify.dev/docs/api/admin-graphql/latest for reference and creating the right queries
+9. Always use the latest Shopify API docs from https://shopify.dev/docs/api/admin-graphql/latest before touching APIs and graphql mutations
 > ⚠️ **Ethics/Compliance**: Use reasonable rate limiting. This tool is for internal catalog building.
 
 ---
@@ -29,38 +29,66 @@ Write a **Python 3.11** CLI tool that:
 ## Architecture
 The tool has commands like scrape, process, upload. We will break down the workflow for each.
 
-Overall flow is Scraped -> Processed -> Uploaded. 
+## Processing Pipeline Architecture
 
-For every command we will  **Persist progress** (SQLite or JSONL) so the tool can resume and so items aren’t reprocessed unnecessarily through every stage of the pipeline.
+The tool operates as a **stateful processing pipeline** where each command validates pipeline stages and avoids reprocessing completed items.
 
-### Scrape command
-1. **Fetch Items** from ERPNext (paginated).
-2. For each Item, **pick competitor link** using the domain priority order.
-3. **Scrape** name, product handle, description, image URLs (Shopify JSON if possible → otherwise fallbacks). Don't download images in this step
-4. Mark content status as Scraped
+### Content Status Flow
+```
+null/empty → "Scraped" → "Processed" → "Approved" → "Synchronized"
+```
 
-### Process command
-1. **Fetch Items** from ERPNext (paginated).
+### Pipeline Stage Validation
+- **scrape** command: Only processes items with null/empty `content_status`
+- **process** command: Only processes items with `content_status = "Scraped"`
+- **upload** command: Only processes items with `content_status = "Approved"`
+- Each command skips items already in later pipeline stages to prevent reprocessing
 
-For each item
-1. Call **OpenAI** to **SEO-optimize** the description into Shopify-ready HTML.
-2. If custom_shopify_product_handle field is empty, populate it with the scraped handle, else leave as is
-3. if custom_shopify_product_name field is empty, populate it with the scraped product name
-4. Create a meta SEO Product title that is short and store it in custom_shopify_seo_title field. Use the custom_product_type, custom_brand_custom and custom_gender separated by | if possible. Call **OpenAI** to check if this makes sense or ask for a fallback from **OpenAI**
-5. Create a meta SEO Product description that is inline with standard SEO practices and store it in custom_shopify_meta_description field
-6. Mark content as Processed
+### Scrape Command
+**Pipeline Stage**: `null/empty` → `"Scraped"`
 
-### Upload
-1. **Fetch Items** from ERPNext (paginated).
+1. **Fetch Items** from ERPNext (paginated), filtering out items already scraped
+2. Skip items with `content_status` in ["Scraped", "Processed", "Approved", "Synchronized"]
+3. For each qualifying item:
+   - **Pick competitor link** using domain priority order
+   - **Scrape** name, product handle, description, image URLs (Shopify JSON → fallbacks)
+   - Don't download images in this step (done during upload)
+4. **Mark content status as "Scraped"**
 
-For each item
-0. **Preview** to user: show product handle, title, description, image filenames; ask for **approval** + **price** before any changes are made in Shopify and ERPNext. 
-1. Check if product exists in Shopify by checking if custom_shopify_product_handle exists 
-2. If the product exists, we need to compare if data in ERPNext is different than that in Shopify. ERPNext is the source of truth and will override whatever is in shopify. Update product name, description, images. Images should be taken from custom_scraped_images field.
-3. **Download** images given in custom_scraped_images field to a local cache folder (e.g., `./data/images/<item_code>/...`).
-4. If product does not exist, then create a new product using the product with handle custom_shopify_product_handle and item name from custom_shopify_product_name, description from custom_shopify_description_html, images downloaded in step 3 maintaining order
-5. Get the Shopify product id of the product and add it to custom_shopify_product_id field in ERPNext.
-6. Mark content status as Uploaded
+### Process Command
+**Pipeline Stage**: `"Scraped"` → `"Processed"` → `"Approved"`
+
+1. **Fetch Items** with `content_status = "Scraped"` from ERPNext (paginated)
+2. For each item:
+   - Call **OpenAI** to **SEO-optimize** the description into Shopify-ready HTML
+   - If `custom_shopify_product_handle` field is empty, populate with scraped handle
+   - If `custom_shopify_product_name` field is empty, populate with scraped product name
+   - Create meta SEO Product title using `custom_product_type`, `custom_brand_custom`, `custom_gender`
+   - Create meta SEO Product description following standard SEO practices
+   - **Show preview** to user (Product name, SEO title, meta description, description preview)
+   - **Ask for user approval** (y/n/q)
+3. **Mark content status**:
+   - `"Approved"` if user approves
+   - `"Processed"` if user wants to review later
+
+### Upload Command
+**Pipeline Stage**: `"Approved"` → `"Synchronized"`
+
+1. **Fetch Items** with `content_status = "Approved"` from ERPNext (paginated)
+2. For each item:
+   - **Preview** to user: show product handle, title, description, image filenames
+   - Ask for **approval** + **price** before any changes are made
+   - Check if product exists in Shopify by `custom_shopify_product_handle`
+   - **Download** images from `custom_scraped_images` field to local cache
+   - Create/Update product in Shopify with all metadata
+   - Store Shopify product ID in `custom_shopify_product_id` field
+3. **Mark content status as "Synchronized"** (final pipeline state)
+
+### Resume and State Management
+- Each command checks content status before processing
+- Items in later pipeline stages are automatically skipped
+- Pipeline can be resumed at any stage without reprocessing completed items
+- Status command shows counts for each pipeline stage
 
 ---
 
