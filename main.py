@@ -12,6 +12,7 @@ from datetime import datetime
 
 from config.settings import settings
 from utils.logger import setup_logger, get_logger
+from utils.url_validator import URLValidator, format_validation_report
 from clients.erpnext import ERPNextClient
 from clients.shopify import ShopifyClient
 from scrapers.scraper import ProductScraper
@@ -38,6 +39,8 @@ class ProductPipeline:
             self.scraper = ProductScraper()
             self.image_manager = ImageManager()
             self.seo_optimizer = SEOOptimizer()
+            from services.pricing import PricingService
+            self.pricing = PricingService(self.erpnext, self.shopify, self.scraper)
         except Exception as e:
             logger.error(f"Failed to initialize components: {e}")
             self.ui.show_error(f"Initialization failed: {e}")
@@ -115,8 +118,13 @@ class ProductPipeline:
                     self.ui.show_error(f"Item {item_code} not found")
                     return 0
 
+                # Check if item is excluded from online stores
+                if item.exclude_from_online_stores:
+                    self.ui.show_info(f"Item {item_code} is excluded from online stores - skipping")
+                    return 0
+
                 # Check if item needs scraping
-                if item.content_status in ["Scraped", "Processed", "Approved", "Synchronized"]:
+                if item.content_status in ["SCRAPED", "OPTIMIZED", "APPROVED", "OVERRIDE"]:
                     self.ui.show_info(f"Item {item_code} already has status '{item.content_status}' - skipping scrape")
                     return 0
 
@@ -126,7 +134,7 @@ class ProductPipeline:
                 all_items = self.erpnext.get_all_items()
                 items = []
                 for item in all_items:
-                    if item.content_status not in ["Scraped", "Processed", "Approved", "Synchronized"]:
+                    if item.content_status not in ["SCRAPED", "OPTIMIZED", "APPROVED", "OVERRIDE"]:
                         items.append(item)
                     else:
                         logger.debug(f"Skipping {item.item_code} - already {item.content_status}")
@@ -198,7 +206,7 @@ class ProductPipeline:
         self.ui.show_info(f"Scraping complete: {success_count} success, {error_count} errors")
         return success_count
     
-    def process_items(self, item_code: Optional[str] = None, content_status: str = "Scraped", limit: Optional[int] = None, auto_approve: bool = False) -> int:
+    def process_items(self, item_code: Optional[str] = None, content_status: str = "SCRAPED", limit: Optional[int] = None, auto_approve: bool = False) -> int:
         """Process scraped data with AI optimization"""
         self.ui.show_info("Starting processing...")
         
@@ -212,32 +220,51 @@ class ProductPipeline:
                 if not item:
                     self.ui.show_error(f"Item {item_code} not found")
                     return 0
+
+                # Check if item is excluded from online stores
+                if item.exclude_from_online_stores:
+                    self.ui.show_info(f"Item {item_code} is excluded from online stores - skipping")
+                    return 0
+
                 items = [item]
             else:
                 items = self.erpnext.get_items_by_status(content_status=content_status, limit=limit)
             
             for i, item in enumerate(items, 1):
                 self.ui.show_info(f"[{i}] Processing: {item.item_code}")
-                
+
                 try:
-                    # Get SEO title parts
-                    title_parts = item.get_seo_title_parts()
-                    
-                    # Optimize content with AI
-                    seo_content = self.seo_optimizer.optimize_content(
-                        item.scraped_name or item.shopify_product_name,
-                        item.scraped_description or '',
-                        item.item_code,
-                        title_parts=title_parts
-                    )
-                    
-                    # Add scraped data to processed data for field population
-                    processed_data = seo_content.copy()
-                    
+                    # Check if this is from Ariaz - if so, skip SEO optimization
+                    competitor = item.get_competitor_from_url(item.scrape_source_url or '')
+                    is_ariaz = competitor and competitor.get('competitor_name') == 'Ariaz'
+
+                    if is_ariaz:
+                        self.ui.show_info(f"Item from Ariaz - keeping description as-is (no SEO optimization)")
+
+                        # Use scraped description directly without SEO optimization
+                        processed_data = {
+                            'description_html': item.scraped_description or '',
+                            'seo_title': item.scraped_name or item.shopify_product_name or '',
+                            'meta_description': (item.scraped_description or '')[:160] if item.scraped_description else ''
+                        }
+                    else:
+                        # Get SEO title parts
+                        title_parts = item.get_seo_title_parts()
+
+                        # Optimize content with AI
+                        seo_content = self.seo_optimizer.optimize_content(
+                            item.scraped_name or item.shopify_product_name,
+                            item.scraped_description or '',
+                            item.item_code,
+                            title_parts=title_parts
+                        )
+
+                        processed_data = seo_content.copy()
+
                     # Populate handle field if empty
                     if not item.shopify_product_handle and item.scraped_handle:
                         processed_data['product_handle'] = item.scraped_handle
-                    
+
                     # Populate name field if empty
                     if not item.shopify_product_name and item.scraped_name:
                         processed_data['product_name'] = item.scraped_name
@@ -275,7 +302,7 @@ class ProductPipeline:
 
                             # Update approval status
                             if self.erpnext.update_approval_status(item.item_code, approved, dry_run=self.dry_run):
-                                status_text = "Approved" if approved else "Processed (pending approval)"
+                                status_text = "APPROVED" if approved else "OPTIMIZED (pending approval)"
                                 self.ui.show_success(f"Processed {item.item_code} - {status_text}")
                             else:
                                 self.ui.show_error(f"Failed to update approval status for {item.item_code}")
@@ -304,7 +331,7 @@ class ProductPipeline:
         self.ui.show_info(f"Processing complete: {success_count} success, {error_count} errors")
         return success_count
     
-    def upload_items(self, item_code: Optional[str] = None, content_status: str = "Approved", limit: Optional[int] = None) -> int:
+    def upload_items(self, item_code: Optional[str] = None, content_status: str = "APPROVED", limit: Optional[int] = None) -> int:
         """Upload processed items to Shopify"""
         self.ui.show_info("Starting Shopify upload...")
         
@@ -321,14 +348,26 @@ class ProductPipeline:
                 if not item:
                     self.ui.show_error(f"Item {item_code} not found")
                     return 0
+
+                # Check if item is excluded from online stores
+                if item.exclude_from_online_stores:
+                    self.ui.show_info(f"Item {item_code} is excluded from online stores - skipping")
+                    return 0
+
                 items = [item]
             else:
                 items = self.erpnext.get_items_by_status(content_status=content_status, limit=limit)
             
             for i, item in enumerate(items, 1):
                 self.ui.show_info(f"[{i}] Uploading: {item.item_code}")
-                
+
                 try:
+                    # Check for OVERRIDE status - skip these items
+                    if item.content_status == "OVERRIDE":
+                        self.ui.show_warning(f"Skipping {item.item_code} - content status is OVERRIDE (manually edited)")
+                        # Update sync status to SKIPPED
+                        self.erpnext.update_sync_status(item.item_code, "SKIPPED", dry_run=self.dry_run)
+                        continue
                     # Check if already exists in Shopify
                     existing_product = self.shopify.get_existing_product(item.shopify_product_handle, item.item_code)
                     logger.info(existing_product)
@@ -422,7 +461,7 @@ class ProductPipeline:
                             dry_run=self.dry_run
                         )
                         success_count += 1
-                        self.ui.show_success(f"Successfully {action_text} {item.item_code} in Shopify - Status: Synchronized")
+                        self.ui.show_success(f"Successfully {action_text} {item.item_code} in Shopify - Status: SYNCED")
                     else:
                         self.erpnext.update_sync_status(item.item_code, "Error", dry_run=self.dry_run)
                         error_count += 1
@@ -454,13 +493,13 @@ class ProductPipeline:
             return False
         
         # Step 2: Process
-        processed = self.process_items(item_code, "Scraped", limit)
+        processed = self.process_items(item_code, "SCRAPED", limit)
         if processed == 0:
             self.ui.show_error("No items processed, stopping pipeline")
             return False
-        
+
         # Step 3: Upload
-        uploaded = self.upload_items(item_code, "Approved", limit)
+        uploaded = self.upload_items(item_code, "APPROVED", limit)
         
         self.ui.show_success(f"Pipeline complete: {scraped} scraped, {processed} processed, {uploaded} uploaded")
         return uploaded > 0
@@ -489,18 +528,272 @@ class ProductPipeline:
             stats = {}
             
             # Get counts by content status
-            for status in ["Scraped", "Processed", "Approved", "Synchronized"]:
+            for status in ["SCRAPED", "OPTIMIZED", "APPROVED", "OVERRIDE"]:
                 count = len(list(self.erpnext.get_items_by_status(content_status=status, limit=1000)))
                 stats[f"Content {status}"] = count
-            
-            # Get counts by sync status  
-            for status in ["Pending", "Synced", "Error", "Skipped"]:
+
+            # Get counts by sync status
+            for status in ["PENDING", "SYNCED", "Error", "SKIPPED"]:
                 count = len(list(self.erpnext.get_items_by_status(sync_status=status, limit=1000)))
                 stats[f"Sync {status}"] = count
             
             self.ui.show_info("Overall Statistics:")
             for status, count in stats.items():
                 self.ui.show_info(f"  {status}: {count}")
+
+    def sync_stock(self, buffer_threshold: int = 3, limit: Optional[int] = None) -> bool:
+        """Sync stock from ERPNext to Shopify with buffer logic"""
+        from services.stock_sync import StockSyncService
+
+        self.ui.show_info(f"Starting stock synchronization (buffer threshold: {buffer_threshold})...")
+
+        if not self.test_connections():
+            return False
+
+        try:
+            # Initialize stock sync service
+            stock_sync = StockSyncService(
+                erpnext_client=self.erpnext,
+                shopify_client=self.shopify,
+                buffer_threshold=buffer_threshold,
+                dry_run=self.dry_run
+            )
+
+            # Get primary location ID
+            location_id = stock_sync.get_primary_location_id()
+            if not location_id:
+                self.ui.show_error("Failed to get Shopify location ID")
+                return False
+
+            # Sync all stock
+            summary = stock_sync.sync_all_stock(location_id=location_id, limit=limit)
+
+            # Display summary
+            self.ui.show_info("\n--- Stock Sync Summary ---")
+            self.ui.show_info(f"Total Products: {summary['total_products']}")
+            self.ui.show_info(f"Total Variants: {summary['total_variants']}")
+            self.ui.show_info(f"Updated: {summary['updated']}")
+            self.ui.show_info(f"Skipped: {summary['skipped']}")
+            self.ui.show_info(f"Errors: {summary['errors']}")
+
+            if summary.get('fatal_error'):
+                self.ui.show_error(f"Fatal error: {summary['fatal_error']}")
+                return False
+
+            if summary['errors'] > 0:
+                self.ui.show_warning(f"Completed with {summary['errors']} errors")
+            else:
+                self.ui.show_success("Stock sync completed successfully")
+
+            return summary['errors'] == 0
+
+        except Exception as e:
+            logger.error(f"Fatal error during stock sync: {e}", exc_info=True)
+            self.ui.show_error(f"Fatal error: {e}")
+            return False
+
+    def pricing_scrape(self, item_code: Optional[str] = None, limit: Optional[int] = None) -> bool:
+        """Scrape competitor prices and write to ERPNext price lists"""
+        self.ui.show_info("Starting competitor price scraping...")
+
+        if not self.test_connections():
+            return False
+
+        try:
+            summary = self.pricing.scrape_and_update_prices(limit=limit, dry_run=self.dry_run)
+            self.ui.show_info("\n--- Price Scrape Summary ---")
+            self.ui.show_info(f"Updated: {summary['updated']}")
+            self.ui.show_info(f"Errors: {summary['errors']}")
+            self.ui.show_info(f"Skipped: {summary['skipped']}")
+            return summary['errors'] == 0
+        except Exception as e:
+            logger.error(f"Fatal error during price scraping: {e}", exc_info=True)
+            self.ui.show_error(f"Fatal error: {e}")
+            return False
+
+    def pricing_update_shopify(self, price_list: str, limit: Optional[int] = None) -> bool:
+        """Sync ERPNext price list values to Shopify"""
+        self.ui.show_info(f"Syncing prices from '{price_list}' to Shopify...")
+
+        if not self.test_connections():
+            return False
+
+        try:
+            summary = self.pricing.sync_all_prices_to_shopify(
+                price_list=price_list, limit=limit, dry_run=self.dry_run
+            )
+            self.ui.show_info("\n--- Shopify Price Sync Summary ---")
+            self.ui.show_info(f"Updated: {summary['updated']}")
+            self.ui.show_info(f"Errors: {summary['errors']}")
+            self.ui.show_info(f"Skipped: {summary['skipped']}")
+            return summary['errors'] == 0
+        except Exception as e:
+            logger.error(f"Fatal error during Shopify price sync: {e}", exc_info=True)
+            self.ui.show_error(f"Fatal error: {e}")
+            return False
+
+    def validate_links(self, item_code: Optional[str] = None, limit: Optional[int] = None,
+                      save_report: bool = False) -> Dict[str, List[str]]:
+        """
+        Validate all competitor links and report broken ones
+
+        Returns:
+            Dict with 'ok', 'errors', and 'warnings' lists of item codes
+        """
+        self.ui.show_info("Starting URL validation...")
+
+        validator = URLValidator()
+        results = {
+            'ok': [],
+            'errors': [],
+            'warnings': []
+        }
+
+        report_lines = [
+            "=" * 80,
+            "Competitor Link Validation Report",
+            f"Generated: {datetime.now().isoformat()}",
+            "=" * 80,
+            ""
+        ]
+
+        try:
+            # Get items to validate
+            if item_code:
+                item = self.erpnext.get_item_by_code(item_code)
+                if not item:
+                    self.ui.show_error(f"Item {item_code} not found")
+                    return results
+                items = [item]
+            else:
+                items = list(self.erpnext.get_all_items())
+                if limit:
+                    items = items[:limit]
+
+            self.ui.show_info(f"Validating links for {len(items)} items...")
+
+            for i, item in enumerate(items, 1):
+                if i % 10 == 0:
+                    self.ui.show_info(f"Progress: {i}/{len(items)}")
+
+                # Skip items that are excluded from online stores
+                if item.exclude_from_online_stores:
+                    logger.debug(f"Skipping {item.item_code} - excluded from online stores")
+                    continue
+
+                # Prepare links dict
+                links = {
+                    'link_1': item.competitor_link_1,
+                    'link_2': item.competitor_link_2,
+                    'link_3': item.competitor_link_3
+                }
+
+                # Skip items with no links
+                if not any(links.values()):
+                    logger.debug(f"Skipping {item.item_code} - no competitor links")
+                    continue
+
+                # Validate all links for this item
+                validation_results = validator.validate_competitor_links(item.item_code, links)
+
+                # Generate report for this item
+                item_report = format_validation_report(item.item_code, validation_results)
+                report_lines.append(item_report)
+
+                # Categorize results based on how many links are working
+                total_links = 0
+                working_links = 0
+
+                for link_name, result in validation_results.items():
+                    if not result['url']:
+                        continue
+
+                    total_links += 1
+
+                    # Consider a link "working" if both URL and JSON endpoint are valid
+                    if result['is_valid'] and result['json_works']:
+                        working_links += 1
+                        logger.debug(f"{item.item_code} - {link_name}: OK")
+                    elif result['is_valid'] and not result['json_works']:
+                        self.ui.show_warning(
+                            f"{item.item_code} - {link_name}: URL OK but JSON endpoint FAILED - {result['json_error']}"
+                        )
+                    else:
+                        self.ui.show_error(
+                            f"{item.item_code} - {link_name}: URL FAILED - {result['url_error']}"
+                        )
+
+                # Categorize based on working link count
+                if total_links == 0:
+                    # No links defined - skip
+                    continue
+                elif working_links == total_links:
+                    # All links working - OK
+                    results['ok'].append(item.item_code)
+                    logger.debug(f"{item.item_code} - All {total_links} links working")
+                elif working_links > 0:
+                    # At least one link working - Warning
+                    results['warnings'].append(item.item_code)
+                    self.ui.show_warning(f"{item.item_code} - Only {working_links}/{total_links} links working")
+                else:
+                    # No links working - Error
+                    results['errors'].append(item.item_code)
+                    self.ui.show_error(f"{item.item_code} - NO links working ({total_links} total)")
+
+
+            # Summary
+            report_lines.append("")
+            report_lines.append("=" * 80)
+            report_lines.append("Summary")
+            report_lines.append("=" * 80)
+            report_lines.append(f"Total items checked: {len(items)}")
+            report_lines.append(f"Items with all links working (OK): {len(results['ok'])}")
+            report_lines.append(f"Items with some links working (WARNING): {len(results['warnings'])}")
+            report_lines.append(f"Items with NO links working (ERROR): {len(results['errors'])}")
+            report_lines.append("")
+
+            if results['errors']:
+                report_lines.append("CRITICAL - Items with NO working links:")
+                for item_code in results['errors']:
+                    report_lines.append(f"  - {item_code}")
+                report_lines.append("")
+
+            if results['warnings']:
+                report_lines.append("WARNING - Items with only some links working:")
+                for item_code in results['warnings']:
+                    report_lines.append(f"  - {item_code}")
+                report_lines.append("")
+
+            # Print summary
+            self.ui.show_info("\n" + "=" * 80)
+            self.ui.show_info("Validation Summary")
+            self.ui.show_info("=" * 80)
+            self.ui.show_info(f"Total items checked: {len(items)}")
+            self.ui.show_success(f"✓ Items with ALL links working: {len(results['ok'])}")
+
+            if results['warnings']:
+                self.ui.show_warning(f"⚠ Items with SOME links working: {len(results['warnings'])}")
+                self.ui.show_info("  Warning items: " + ", ".join(results['warnings']))
+
+            if results['errors']:
+                self.ui.show_error(f"✗ Items with NO links working: {len(results['errors'])}")
+                self.ui.show_info("  Error items: " + ", ".join(results['errors']))
+
+            # Save report if requested
+            if save_report:
+                report_path = Path(f"./link_validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+                report_path.write_text("\n".join(report_lines))
+                self.ui.show_success(f"Report saved to: {report_path}")
+
+            return results
+
+        except KeyboardInterrupt:
+            self.ui.show_warning("Validation interrupted by user")
+            return results
+        except Exception as e:
+            logger.error(f"Fatal error during validation: {e}", exc_info=True)
+            self.ui.show_error(f"Fatal error: {e}")
+            return results
 
 def main():
     """CLI entry point"""
@@ -509,19 +802,33 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  scrape    Scrape competitor data into ERPNext
-  process   Process scraped data with AI optimization  
-  upload    Upload processed products to Shopify
-  pipeline  Run full scrape → process → upload pipeline
-  status    Show pipeline status and statistics
+  scrape         Scrape competitor data into ERPNext (status: null → SCRAPED)
+  process        Process scraped data with AI optimization (status: SCRAPED → OPTIMIZED → APPROVED)
+  upload         Upload processed products to Shopify (status: APPROVED → SYNCED)
+  pipeline       Run full scrape → process → upload pipeline
+  status         Show pipeline status and statistics
+  sync-stock     Sync inventory from ERPNext to Shopify
+  validate-links Validate competitor links and report broken ones
+  pricing        Pricing tools (scrape-prices | update-shopify)
+
+Lifecycle States:
+  Content Status: null → SCRAPED → OPTIMIZED → APPROVED (or OVERRIDE for manual edits)
+  Upload Status:  PENDING → SYNCED (or SKIPPED for OVERRIDE items)
 
 Examples:
   %(prog)s scrape --limit 10 --dry-run
-  %(prog)s process --status Scraped --limit 5
-  %(prog)s process --status Scraped --auto-approve
-  %(prog)s upload --status Approved
+  %(prog)s process --status SCRAPED --limit 5
+  %(prog)s process --status SCRAPED --auto-approve
+  %(prog)s process --status OPTIMIZED --limit 5    # Re-process items pending approval
+  %(prog)s upload --status APPROVED
   %(prog)s pipeline --item-code ITEM-001
   %(prog)s status --item-code ITEM-001 --detailed
+  %(prog)s sync-stock --buffer 3 --dry-run
+  %(prog)s sync-stock --buffer 5 --limit 50
+  %(prog)s validate-links --limit 20
+  %(prog)s validate-links --item-code ITEM-001 --save-report
+  %(prog)s pricing scrape-prices --dry-run
+  %(prog)s pricing update-shopify --price-list "Our Online"
         """
     )
     
@@ -544,15 +851,15 @@ Examples:
     # Process command
     process_parser = subparsers.add_parser('process', help='Process scraped data with AI')
     process_parser.add_argument('--item-code', help='Process a single item')
-    process_parser.add_argument('--status', default='Scraped', help='Content status to process (default: Scraped)')
+    process_parser.add_argument('--status', default='SCRAPED', help='Content status to process (default: SCRAPED)')
     process_parser.add_argument('--limit', type=int, help='Maximum items to process')
     process_parser.add_argument('--auto-approve', action='store_true', help='Automatically approve all processed items without prompting')
     process_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
-    
+
     # Upload command
     upload_parser = subparsers.add_parser('upload', help='Upload processed products to Shopify')
     upload_parser.add_argument('--item-code', help='Upload a single item')
-    upload_parser.add_argument('--status', default='Approved', help='Content status to upload (default: Approved)')
+    upload_parser.add_argument('--status', default='APPROVED', help='Content status to upload (default: APPROVED)')
     upload_parser.add_argument('--limit', type=int, help='Maximum items to upload')
     upload_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
     
@@ -566,7 +873,32 @@ Examples:
     status_parser = subparsers.add_parser('status', help='Show pipeline status')
     status_parser.add_argument('--item-code', help='Show status for single item')
     status_parser.add_argument('--detailed', action='store_true', help='Show detailed information')
-    
+
+    # Sync-stock command
+    sync_stock_parser = subparsers.add_parser('sync-stock', help='Sync inventory from ERPNext to Shopify')
+    sync_stock_parser.add_argument('--buffer', type=int, default=3, help='Stock buffer threshold (default: 3)')
+    sync_stock_parser.add_argument('--limit', type=int, help='Maximum products to sync')
+    sync_stock_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
+
+    # Validate-links command
+    validate_links_parser = subparsers.add_parser('validate-links', help='Validate competitor links and report broken ones')
+    validate_links_parser.add_argument('--item-code', help='Validate links for a single item')
+    validate_links_parser.add_argument('--limit', type=int, help='Maximum items to check')
+    validate_links_parser.add_argument('--save-report', action='store_true', help='Save validation report to file')
+
+    # Pricing command (two subcommands)
+    pricing_parser = subparsers.add_parser('pricing', help='Pricing tools (scrape-prices | update-shopify)')
+    pricing_subparsers = pricing_parser.add_subparsers(dest='pricing_command', help='Pricing subcommands')
+
+    pricing_scrape_parser = pricing_subparsers.add_parser('scrape-prices', help='Scrape competitor prices into ERPNext price lists')
+    pricing_scrape_parser.add_argument('--limit', type=int, help='Maximum items to process')
+    pricing_scrape_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
+
+    pricing_shopify_parser = pricing_subparsers.add_parser('update-shopify', help='Sync ERPNext price list to Shopify')
+    pricing_shopify_parser.add_argument('--price-list', required=True, help='ERPNext price list to push to Shopify')
+    pricing_shopify_parser.add_argument('--limit', type=int, help='Maximum items to process')
+    pricing_shopify_parser.add_argument('--dry-run', action='store_true', help='Dry run mode')
+
     args = parser.parse_args()
     
     if not args.command:
@@ -595,6 +927,18 @@ Examples:
             pipeline.run_pipeline(args.item_code, args.limit)
         elif args.command == 'status':
             pipeline.show_status(args.item_code, args.detailed)
+        elif args.command == 'sync-stock':
+            pipeline.sync_stock(args.buffer, args.limit)
+        elif args.command == 'validate-links':
+            pipeline.validate_links(args.item_code, args.limit, args.save_report)
+        elif args.command == 'pricing':
+            if args.pricing_command == 'scrape-prices':
+                pipeline.pricing_scrape(args.limit)
+            elif args.pricing_command == 'update-shopify':
+                pipeline.pricing_update_shopify(args.price_list, args.limit)
+            else:
+                pricing_parser.print_help()
+                sys.exit(1)
         else:
             parser.print_help()
             sys.exit(1)

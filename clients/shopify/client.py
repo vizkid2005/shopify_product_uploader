@@ -7,24 +7,26 @@ from .media import MediaManager
 from .products import ProductManager
 from .verification import APIVerification
 from .validation import ShopifyValidation
+from .inventory import InventoryManager
 
 logger = get_logger(__name__)
 
 class ShopifyClient(ShopifyBase):
     """Main Shopify client that orchestrates all Shopify operations"""
-    
-    def __init__(self, store: Optional[str] = None, 
+
+    def __init__(self, store: Optional[str] = None,
                  token: Optional[str] = None,
                  api_version: Optional[str] = None):
         super().__init__(store, token, api_version)
-        
+
         # Initialize components
         self.graphql = GraphQLExecutor(self.graphql_url, self.headers)
         self.media = MediaManager(self.graphql)
         self.products = ProductManager(self.graphql, self.media)
         self.verification = APIVerification(self.graphql, self.api_version, self.graphql_url, self.store)
         self.validation = ShopifyValidation(self.graphql)
-        
+        self.inventory = InventoryManager(self.graphql)
+
         # Note: GraphQL verification can be performed manually using verify_graphql_access()
         # Automatic verification on init is disabled to allow graceful handling of connection issues
     

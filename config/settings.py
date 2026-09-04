@@ -1,6 +1,7 @@
 import os
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,39 +11,63 @@ class Settings:
     ERP_BASE_URL: str = os.getenv("ERP_BASE_URL", "")
     ERP_API_KEY: str = os.getenv("ERP_API_KEY", "")
     ERP_API_SECRET: str = os.getenv("ERP_API_SECRET", "")
-    
+
     # Shopify
     SHOPIFY_STORE: str = os.getenv("SHOPIFY_STORE", "")
     SHOPIFY_ADMIN_TOKEN: str = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
     SHOPIFY_API_VERSION: str = os.getenv("SHOPIFY_API_VERSION", "2025-01")
-    
+
     # OpenAI
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    
+
     # Paths
     IMAGE_DIR: Path = Path(os.getenv("IMAGE_DIR", "./data/images"))
     DB_PATH: Path = Path(os.getenv("DB_PATH", "./data/state.db"))
     LOG_FILE: Path = Path(os.getenv("LOG_FILE", "./logs/uploader.log"))
-    
+    COMPETITOR_CONFIG: Path = Path(os.getenv("COMPETITOR_CONFIG", "./competitors.json"))
+
     # Behavior
     PAGE_SIZE: int = int(os.getenv("PAGE_SIZE", "100"))
     RATE_LIMIT_RPS: float = float(os.getenv("RATE_LIMIT_RPS", "1.5"))
     DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
     APPROVAL_MODE: str = os.getenv("APPROVAL_MODE", "manual")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-    
+
     # Scraping
     USER_AGENT: str = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; ProductUploader/1.0)")
     SCRAPE_TIMEOUT: int = int(os.getenv("SCRAPE_TIMEOUT", "30"))
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
-    
-    # Competitor priority order
-    COMPETITOR_PRIORITY = [
-        "ourascents.com",
-        "hamidi.ae", 
-        "hamidi.us"
-    ]
+
+    # Competitor configuration (loaded dynamically)
+    _competitors: Optional[List[Dict[str, Any]]] = None
+
+    @classmethod
+    def get_competitors(cls) -> List[Dict[str, Any]]:
+        """Load and cache competitor configuration from JSON file"""
+        if cls._competitors is None:
+            try:
+                with open(cls.COMPETITOR_CONFIG, 'r') as f:
+                    cls._competitors = json.load(f)
+            except FileNotFoundError:
+                raise ValueError(f"Competitor config file not found: {cls.COMPETITOR_CONFIG}")
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON in competitor config: {e}")
+        return cls._competitors
+
+    @classmethod
+    def get_competitor_by_domain(cls, domain: str) -> Optional[Dict[str, Any]]:
+        """Get competitor configuration by domain"""
+        competitors = cls.get_competitors()
+        for competitor in competitors:
+            if competitor['domain'] == domain:
+                return competitor
+        return None
+
+    @classmethod
+    def get_competitor_domains(cls) -> List[str]:
+        """Get list of competitor domains in priority order"""
+        return [c['domain'] for c in cls.get_competitors()]
     
     @classmethod
     def validate(cls) -> bool:

@@ -47,6 +47,9 @@ class ERPNextItem:
     shopify_sync_status: Optional[str] = None
     last_shopify_sync: Optional[str] = None
     shopify_product_id: Optional[str] = None
+
+    # Exclusion flags
+    exclude_from_online_stores: Optional[bool] = None
     
     def get_priority_link(self) -> Optional[str]:
         """Get the highest priority competitor link based on domain"""
@@ -55,19 +58,34 @@ class ERPNextItem:
             self.competitor_link_2,
             self.competitor_link_3
         ]
-        
-        for domain in settings.COMPETITOR_PRIORITY:
+
+        # Use dynamic competitor domains in priority order
+        competitor_domains = settings.get_competitor_domains()
+
+        for domain in competitor_domains:
             for link in links:
                 if link and domain in link:
-                    logger.debug(f"Selected link for {self.item_code}: {link}")
+                    logger.debug(f"Selected link for {self.item_code}: {link} (domain: {domain})")
                     return link
-        
+
         # Return first non-empty link if no priority matches
         for link in links:
             if link:
                 logger.debug(f"Using fallback link for {self.item_code}: {link}")
                 return link
-        
+
+        return None
+
+    def get_competitor_from_url(self, url: str) -> Optional[Dict[str, Any]]:
+        """Identify which competitor a URL belongs to"""
+        if not url:
+            return None
+
+        competitors = settings.get_competitors()
+        for competitor in competitors:
+            if competitor['domain'] in url:
+                return competitor
+
         return None
     
     def get_seo_title_parts(self) -> List[str]:
@@ -171,7 +189,10 @@ class ERPNextClient:
                     'custom_content_status',
                     'custom_shopify_sync_status',
                     'custom_last_shopify_sync',
-                    'custom_shopify_product_id'
+                    'custom_shopify_product_id',
+
+                    # Exclusion flags
+                    'custom_exclude_from_online_stores'
                 ]),
                 'filters': json.dumps({
                     'disabled': 0
@@ -252,9 +273,17 @@ class ERPNextClient:
                     content_status=item_data.get('custom_content_status'),
                     shopify_sync_status=item_data.get('custom_shopify_sync_status'),
                     last_shopify_sync=item_data.get('custom_last_shopify_sync'),
-                    shopify_product_id=item_data.get('custom_shopify_product_id')
+                    shopify_product_id=item_data.get('custom_shopify_product_id'),
+
+                    # Exclusion flags
+                    exclude_from_online_stores=item_data.get('custom_exclude_from_online_stores', 0) == 1
                 )
                 
+                # Skip items that are excluded from online stores
+                if item.exclude_from_online_stores:
+                    logger.debug(f"Skipping item {item.item_code}: excluded from online stores")
+                    continue
+
                 # Only yield items that have competitor links (shopify fields are optional for scraping)
                 if item.get_priority_link():
                     total_fetched += 1
@@ -320,7 +349,10 @@ class ERPNextClient:
                 content_status=item_data.get('custom_content_status'),
                 shopify_sync_status=item_data.get('custom_shopify_sync_status'),
                 last_shopify_sync=item_data.get('custom_last_shopify_sync'),
-                shopify_product_id=item_data.get('custom_shopify_product_id')
+                shopify_product_id=item_data.get('custom_shopify_product_id'),
+
+                # Exclusion flags
+                exclude_from_online_stores=item_data.get('custom_exclude_from_online_stores', 0) == 1
             )
         except Exception as e:
             logger.error(f"Error fetching item {item_code}: {e}")
@@ -339,7 +371,7 @@ class ERPNextClient:
 
         try:
             url = f"{self.base_url}Item/{item_code}"
-            
+
             # Prepare update data
             update_data = {
                 "custom_scraped_images": json.dumps(scraped_data.get('images', [])),
@@ -348,15 +380,15 @@ class ERPNextClient:
                 "custom_scraped_handle": scraped_data.get('handle', ''),
                 "custom_scrape_source_url": scraped_data.get('source_url', ''),
                 "custom_scrape_date": scraped_data.get('scrape_date', ''),
-                "custom_content_status": "Scraped"
+                "custom_content_status": "SCRAPED"
             }
-            
+
             response = self.session.put(url, json=update_data)
             response.raise_for_status()
-            
+
             logger.info(f"Successfully updated scraped data for {item_code}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error updating scraped data for {item_code}: {e}")
             return False
@@ -374,36 +406,36 @@ class ERPNextClient:
 
         try:
             url = f"{self.base_url}Item/{item_code}"
-            
+
             # Prepare update data
             update_data = {
                 "custom_shopify_description_html": processed_data.get('description_html', ''),
                 "custom_shopify_seo_title": processed_data.get('seo_title', ''),
                 "custom_shopify_meta_description": processed_data.get('meta_description', ''),
-                "custom_content_status": "Processed"
+                "custom_content_status": "OPTIMIZED"
             }
-            
+
             # Populate handle field if empty and scraped handle exists
             if processed_data.get('product_handle'):
                 update_data["custom_shopify_product_handle"] = processed_data['product_handle']
-            
+
             # Populate name field if empty and scraped name exists
             if processed_data.get('product_name'):
                 update_data["custom_shopify_product_name"] = processed_data['product_name']
-            
+
             response = self.session.put(url, json=update_data)
             response.raise_for_status()
-            
+
             logger.info(f"Successfully updated processed data for {item_code}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error updating processed data for {item_code}: {e}")
             return False
 
     def update_approval_status(self, item_code: str, approved: bool, dry_run: bool = False) -> bool:
-        """Update content status to Approved or keep as Processed"""
-        status = "Approved" if approved else "Processed"
+        """Update content status to APPROVED or keep as OPTIMIZED"""
+        status = "APPROVED" if approved else "OPTIMIZED"
 
         if dry_run:
             logger.info(f"DRY RUN: Would update content status for {item_code} to '{status}'")
@@ -459,9 +491,9 @@ class ERPNextClient:
             return False
 
     def update_synchronized_status(self, item_code: str, shopify_product_id: Optional[str] = None, dry_run: bool = False) -> bool:
-        """Update content status to Synchronized after successful upload"""
+        """Update status after successful upload - content remains APPROVED, upload status becomes SYNCED"""
         if dry_run:
-            logger.info(f"DRY RUN: Would update content status for {item_code} to 'Synchronized'")
+            logger.info(f"DRY RUN: Would update sync status for {item_code} to 'SYNCED'")
             if shopify_product_id:
                 logger.info(f"Shopify product ID: {shopify_product_id}")
             return True
@@ -472,8 +504,8 @@ class ERPNextClient:
             # Prepare update data
             from datetime import datetime
             update_data = {
-                "custom_content_status": "Synchronized",
-                "custom_shopify_sync_status": "Synced",
+                # Content status remains APPROVED (not changed)
+                "custom_shopify_sync_status": "SYNCED",
                 "custom_last_shopify_sync": datetime.now().isoformat()
             }
 
@@ -483,7 +515,7 @@ class ERPNextClient:
             response = self.session.put(url, json=update_data)
             response.raise_for_status()
 
-            logger.info(f"Successfully updated content status for {item_code} to 'Synchronized'")
+            logger.info(f"Successfully updated sync status for {item_code} to 'SYNCED'")
             return True
 
         except Exception as e:
@@ -536,7 +568,10 @@ class ERPNextClient:
                         'custom_shopify_description_html', 'custom_shopify_seo_title', 'custom_shopify_meta_description',
                         
                         # Status fields
-                        'custom_content_status', 'custom_shopify_sync_status', 'custom_last_shopify_sync', 'custom_shopify_product_id'
+                        'custom_content_status', 'custom_shopify_sync_status', 'custom_last_shopify_sync', 'custom_shopify_product_id',
+
+                        # Exclusion flags
+                        'custom_exclude_from_online_stores'
                     ]),
                     'filters': json.dumps(filters),
                     'limit_start': start,
@@ -569,7 +604,7 @@ class ERPNextClient:
                         item_code=item_data.get('item_code', ''),
                         item_name=item_data.get('item_name', ''),
                         description=item_data.get('description'),
-                        
+
                         # Shopify mapping fields
                         shopify_product_name=item_data.get('custom_shopify_product_name'),
                         shopify_product_handle=item_data.get('custom_shopify_product_handle'),
@@ -577,12 +612,12 @@ class ERPNextClient:
                         gender=item_data.get('custom_gender'),
                         quantity=item_data.get('custom_quantity'),
                         product_type=item_data.get('custom_product_type'),
-                        
+
                         # Competitor links
                         competitor_link_1=item_data.get('custom_competitor_link_1'),
                         competitor_link_2=item_data.get('custom_competitor_link_2'),
                         competitor_link_3=item_data.get('custom_competitor_link_3'),
-                        
+
                         # Scraped data fields
                         scraped_images=scraped_images,
                         scraped_description=item_data.get('custom_scraped_description'),
@@ -590,18 +625,26 @@ class ERPNextClient:
                         scraped_handle=item_data.get('custom_scraped_handle'),
                         scrape_source_url=item_data.get('custom_scrape_source_url'),
                         scrape_date=item_data.get('custom_scrape_date'),
-                        
+
                         # Processed content fields
                         shopify_description_html=item_data.get('custom_shopify_description_html'),
                         shopify_seo_title=item_data.get('custom_shopify_seo_title'),
                         shopify_meta_description=item_data.get('custom_shopify_meta_description'),
-                        
+
                         # Status fields
                         content_status=item_data.get('custom_content_status'),
                         shopify_sync_status=item_data.get('custom_shopify_sync_status'),
                         last_shopify_sync=item_data.get('custom_last_shopify_sync'),
-                        shopify_product_id=item_data.get('custom_shopify_product_id')
+                        shopify_product_id=item_data.get('custom_shopify_product_id'),
+
+                        # Exclusion flags
+                        exclude_from_online_stores=item_data.get('custom_exclude_from_online_stores', 0) == 1
                     )
+
+                    # Skip items that are excluded from online stores
+                    if item.exclude_from_online_stores:
+                        logger.debug(f"Skipping item {item.item_code}: excluded from online stores")
+                        continue
 
                     total_fetched += 1
                     yield item
@@ -614,6 +657,133 @@ class ERPNextClient:
             except Exception as e:
                 logger.error(f"Error fetching items by status: {e}")
                 break
+
+    def get_item_stock_qty(self, item_code: str, warehouse: Optional[str] = None) -> Optional[float]:
+        """
+        Get the current stock quantity for an item in ERPNext.
+
+        Args:
+            item_code: The ERPNext item code
+            warehouse: Optional warehouse name. If not provided, returns total stock across all warehouses.
+
+        Returns:
+            Stock quantity as float, or None if item not found or error
+        """
+        try:
+            url = f"{self.base_url}Bin"
+
+            filters = {'item_code': item_code}
+            if warehouse:
+                filters['warehouse'] = warehouse
+
+            params = {
+                'fields': json.dumps(['actual_qty', 'warehouse', 'item_code']),
+                'filters': json.dumps(filters),
+                'limit_page_length': 999
+            }
+
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+            bins = data.get('data', [])
+
+            if not bins:
+                logger.warning(f"No stock records found for item {item_code}")
+                return 0.0
+
+            # Sum up actual_qty across all bins/warehouses
+            total_qty = sum(float(bin_data.get('actual_qty', 0)) for bin_data in bins)
+
+            logger.debug(f"Item {item_code} has {total_qty} units in stock")
+            return total_qty
+
+        except Exception as e:
+            logger.error(f"Error fetching stock for item {item_code}: {e}")
+            return None
+
+    def get_item_price(self, item_code: str, price_list: str) -> Optional[float]:
+        """
+        Get the price of an item in a specific price list.
+
+        Returns:
+            Price as float, or None if no price record found
+        """
+        try:
+            url = f"{self.base_url}Item Price"
+            params = {
+                'filters': json.dumps([
+                    ['item_code', '=', item_code],
+                    ['price_list', '=', price_list]
+                ]),
+                'limit_page_length': 1
+            }
+
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+
+            data = response.json().get('data', [])
+            if not data:
+                return None
+
+            return float(data[0].get('price_rate', 0))
+
+        except Exception as e:
+            logger.error(f"Error fetching price for {item_code} in '{price_list}': {e}")
+            return None
+
+    def upsert_item_price(
+        self,
+        item_code: str,
+        price: float,
+        price_list: str,
+        currency: str,
+        dry_run: bool = False
+    ) -> bool:
+        """
+        Create or update an Item Price record in a price list.
+        """
+        if dry_run:
+            logger.info(f"DRY RUN: Would upsert {item_code} in '{price_list}' to {price} {currency}")
+            return True
+
+        try:
+            url = f"{self.base_url}Item Price"
+
+            # Check for existing record
+            params = {
+                'filters': json.dumps([
+                    ['item_code', '=', item_code],
+                    ['price_list', '=', price_list]
+                ]),
+                'limit_page_length': 1
+            }
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+            existing = response.json().get('data', [])
+
+            if existing:
+                record_url = f"{self.base_url}Item Price/{existing[0]['name']}"
+                response = self.session.put(record_url, json={"price_rate": price})
+                response.raise_for_status()
+                logger.info(f"Updated {item_code} in '{price_list}' to {price} {currency}")
+            else:
+                payload = {
+                    "item_code": item_code,
+                    "price_list": price_list,
+                    "currency": currency,
+                    "price_rate": price,
+                    "selling": 1
+                }
+                response = self.session.post(url, json=payload)
+                response.raise_for_status()
+                logger.info(f"Created {item_code} in '{price_list}' at {price} {currency}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error upserting price for {item_code} in '{price_list}': {e}")
+            return False
 
     def test_connection(self) -> bool:
         """Test the connection to ERPNext"""

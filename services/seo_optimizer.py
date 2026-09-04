@@ -57,40 +57,48 @@ class SEOOptimizer:
         else:
             seo_title = self.create_seo_title([product_name])
         
-        prompt = f"""You are an expert e-commerce SEO copywriter. Create comprehensive SEO content for this product that will rank well and convert visitors.
+        prompt = f"""
+You are an expert e-commerce SEO copywriter who deeply understands how Gen-Z and Millennial shoppers think, read, and make purchase decisions.
+Create high-converting, search-optimized content for the product below.
 
 Product Name: {product_name}
 SEO Title: {seo_title}
-SKU/Item Code: {item_code}
 Original Description:
 {original_description}
 
-Create the following content:
+Create the following output:
 
-1. SEO-optimized product description in HTML format
-2. Meta description for search results (max 160 characters)
+SEO-optimized product description in clean HTML
 
-Requirements for description HTML:
-- Use proper HTML tags (h2, h3, p, ul, li, strong, em) - NO h1 tag
-- Include relevant keywords naturally throughout
-- Structure content with clear sections including Top Notes, Middle Notes and Base Notes if applicable
-- Write in an engaging, professional tone that builds trust
-- Keep it concise but comprehensive (300-500 words ideal)
-- Ensure mobile-friendly formatting with short paragraphs
-- Use semantic HTML for better SEO
+Meta description for search results (160 characters max)
 
-Requirements for meta description:
-- Summarize key benefits and features
-- Include a call to action
-- Stay under 160 characters
-- Be compelling for search results
+HTML Description Requirements
 
-Return your response as a JSON object with these exact keys:
-{{"description_html": "...", "meta_description": "..."}}
+Use only these tags: <h2>, <h3>, <p>, <ul>, <li>, <strong>, <em> — never <h1>
 
-Output only the JSON, no additional text or explanations.
+The first section must be a short description of the scent.
 
-Don't even enclose the json in surrounding json block. Just start with the opening bracket directly
+The second section must always present the fragrance structure in this exact order with heading as Fragrance Notes:
+
+Top Notes
+
+Middle Notes
+
+Base Notes
+
+(Each must be its own clearly separated block.)
+
+The Third section must include SEO keyword related sentences.
+
+Write in a youthful, engaging, confidence-boosting tone that resonates with shoppers under 40.
+
+Keep it concise but complete (ideal length: 100–200 words).
+
+Format for mobile-first readability using short paragraphs and scannable structure.
+
+Include relevant keywords naturally for stronger SEO.
+
+Use semantic HTML for clearer search engine interpretation.
 """
 
         try:
@@ -101,7 +109,7 @@ Don't even enclose the json in surrounding json block. Just start with the openi
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are an expert e-commerce SEO copywriter. You output only JSON content."
+                        "content": "You are an expert e-commerce SEO copywriter. You output only JSON content without the ``` enclosing tags. Return description_html and meta_description"
                     },
                     {
                         "role": "user",
@@ -109,7 +117,7 @@ Don't even enclose the json in surrounding json block. Just start with the openi
                     }
                 ],
                 max_tokens=2500,
-                temperature=0.7
+                temperature=0.85
             )
             
             content = response.choices[0].message.content.strip()
@@ -121,69 +129,28 @@ Don't even enclose the json in surrounding json block. Just start with the openi
                 # Validate required keys
                 required_keys = ['description_html', 'meta_description']
                 if not all(key in seo_content for key in required_keys):
-                    logger.warning("Missing keys in AI response, using fallback")
-                    return self._create_fallback_content(product_name, original_description, seo_title)
-                
+                    logger.error("Missing keys in AI response")
+                    raise ValueError(f"AI response missing required keys. Expected: {required_keys}, Got: {list(seo_content.keys())}")
+
                 # Basic validation
                 if not seo_content['description_html'] or '<' not in seo_content['description_html']:
-                    logger.warning("Invalid HTML in AI response, using fallback")
-                    return self._create_fallback_content(product_name, original_description, seo_title)
-                
+                    logger.error("Invalid HTML in AI response")
+                    raise ValueError(f"AI response contains invalid HTML: {seo_content['description_html'][:100]}")
+
                 # Add the SEO title to the response
                 seo_content['seo_title'] = seo_title
-                
+
                 logger.info(f"Successfully optimized content for {item_code}")
                 return seo_content
-                
-            except json.JSONDecodeError:
-                logger.warning("Invalid JSON response from AI, using fallback")
-                return self._create_fallback_content(product_name, original_description, seo_title)
-            
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON response from AI: {e}")
+                raise ValueError(f"AI returned invalid JSON: {content[:200]}") from e
+
         except Exception as e:
             logger.error(f"OpenAI API error: {e}")
-            return self._create_fallback_content(product_name, original_description, seo_title)
-    
-    def _create_fallback_content(self, product_name: str, description: str, seo_title: str) -> Dict[str, str]:
-        """Create fallback content if ChatGPT API fails"""
-        logger.info("Using fallback content generation")
-        
-        # Clean up description
-        description = description.strip() if description else f"Discover the exceptional quality of {product_name}"
-        
-        # Basic HTML structure
-        html = f"""
-<div class="product-description">
-    <h2>About {product_name}</h2>
-    <p>{description}</p>
-    
-    <h3>Why Choose This Product?</h3>
-    <ul>
-        <li>Alcohol-free</li>
-        <li>High-Quality Product from the heart of the Middle East</li>
-        <li>Exceptional value</li>
-        <li>Fast, reliable shipping</li>
-    </ul>
-    
-    <p><strong>Order {product_name} today as a gift for yourself or a loved one.</strong></p>
-</div>
-""".strip()
-        
-        # Create fallback meta description
-        meta_description = f"Shop {product_name} Premium quality fragrance. Alcohol-free. Proudly Canadian. Shipping to only Canadians."
-        if len(meta_description) > 160:
-            meta_description = meta_description[:157] + "..."
-        
-        return {
-            "description_html": html,
-            "seo_title": seo_title,
-            "meta_description": meta_description
-        }
+            raise
 
-    def _create_fallback_html(self, product_name: str, description: str) -> str:
-        """Create basic HTML if ChatGPT API fails (legacy method)"""
-        content = self._create_fallback_content(product_name, description, product_name)
-        return content["description_html"]
-    
     def test_connection(self) -> bool:
         """Test the OpenAI API connection"""
         try:

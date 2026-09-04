@@ -1,0 +1,26 @@
+[
+  {
+    "competitor_name": "Ariaz",
+    "domain": "ariaz.com",
+    "price_list": "Ariaz Online",
+    "currency": "USD"
+  },
+  {
+    "competitor_name": "Ourascents",
+    "domain": "ourascents.com",
+    "price_list": "Ourascents Online",
+    "currency": "CAD"
+  },
+  {
+    "competitor_name": "Hamidi AE",
+    "domain": "hamidi.ae",
+    "price_list": "Hamidi AE Online",
+    "currency": "AED"
+  },
+  {
+    "competitor_name": "Hamidi US",
+    "domain": "hamidi.us",
+    "price_list": "Hamidi US Online",
+    "currency": "USD"
+  }
+]
